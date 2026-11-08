@@ -1,0 +1,8 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The build program behind `cargo build-all` (see .cargo/config.toml). No dependencies,
+# so it compiles in a second.

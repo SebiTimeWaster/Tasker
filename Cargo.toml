@@ -1,0 +1,43 @@
+[package]
+name = "tasker"
+version = "0.1.0"
+edition = "2024"
+
+# xtask: the build program behind `cargo build-all` (plain cargo commands build only Tasker).
+[workspace]
+members = ["xtask"]
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+dirs = "7.0.0"
+eframe = "0.37.0"
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+symphonia = { version = "0.6.1", features = ["wav", "mp3", "ogg", "vorbis", "flac", "pcm"] }
+
+# Linux: panel icon over D-Bus, X11 helpers, ALSA loaded at runtime, crash signals.
+[target.'cfg(unix)'.dependencies]
+ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
+libc = "0.2"
+libloading = "0.9.0"
+x11rb = { version = "0.14.0", features = ["randr"] }
+
+# Windows: notification-area icon, monitor work areas, waveOut sound.
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Media_Audio", "Win32_Security", "Win32_System_Threading", "Win32_System_Console", "Win32_UI_Controls_Dialogs"] }
+
+[build-dependencies]
+cc = "1.11"
+
+# File/line numbers for Tasker's own code in crash backtraces written to the log
+# (dependencies still show function names). No speed cost.
+[profile.release.package.tasker]
+debug = "line-tables-only"
+
+# eframe 0.37.0 + fix for a panic when a reminder opens while the main window is hidden.
+# See vendor/eframe/README.md.
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }

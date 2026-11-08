@@ -1,0 +1,1159 @@
+//! Modal dialogs: task editor, statistics overlay, app settings.
+
+use std::sync::{Arc, Mutex};
+
+use chrono::{Duration, Local, NaiveDate, Timelike};
+use egui::{Align2, Color32, FontId, Id, Modal, Rect, Response, RichText, Sense, Stroke, TextStyle, Ui};
+
+use crate::audio::Audio;
+use crate::model::*;
+use crate::platform;
+use crate::settings::{fmt_snooze, Corner, Settings, SoundChoice, DEFAULT_SNOOZE, UI_SCALE_PCT};
+use crate::store::Store;
+use crate::views::{month_grid, month_header};
+
+/// Dragging a number field changes it by one step per this many points of mouse travel.
+pub const DRAG_POINTS_PER_STEP: f64 = 3.0;
+
+// ============================================================================ editor
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Date,
+    Weekdays,
+    MonthDays,
+}
+
+pub struct Editor {
+    task_id: Option<i64>,
+    created_at: i64,
+    title: String,
+    notes: String,
+    mode: Mode,
+    date: NaiveDate,
+    /// Month shown by the date calendar.
+    date_month: NaiveDate,
+    repeat: Repeat,
+    wd_mask: u8,
+    wd_every: WeekRepeat,
+    md_mask: u32,
+    /// The start date as picked; the schedule begins at the first matching day on or after it.
+    from: NaiveDate,
+    /// Month shown by the "Starting" calendar.
+    from_month: NaiveDate,
+    /// Effective start in the previous frame (to follow it when it jumps to another month).
+    last_from: NaiveDate,
+    start_h: u32,
+    start_m: u32,
+    est_h: u32,
+    est_m: u32,
+    priority: Priority,
+    notify: NotifyMode,
+    /// Minutes before the start for the announcement (0 = off).
+    notify_ahead: u32,
+    error: Option<String>,
+    confirm_delete: bool,
+    focus_title: bool,
+    /// Tallest the schedule column has been, so switching modes doesn't make the dialog jump.
+    schedule_h: f32,
+}
+
+pub enum EditorResult {
+    Open,
+    Cancel,
+    Save(Task),
+    Delete(i64),
+}
+
+impl Editor {
+    pub fn new(date: NaiveDate) -> Self {
+        let now = Local::now();
+        let start_h = if date == now.date_naive() { (now.hour() + 1).min(23) } else { 9 };
+        Editor {
+            task_id: None,
+            created_at: now.timestamp(),
+            title: String::new(),
+            notes: String::new(),
+            mode: Mode::Date,
+            date,
+            date_month: first_of_month(date),
+            repeat: Repeat::Never,
+            wd_mask: 0,
+            wd_every: WeekRepeat::Weekly,
+            md_mask: 0,
+            from: date,
+            from_month: first_of_month(date),
+            last_from: date,
+            start_h,
+            start_m: 0,
+            est_h: 0,
+            est_m: 30,
+            priority: Priority::Normal,
+            notify: NotifyMode::Sound,
+            notify_ahead: 0,
+            error: None,
+            confirm_delete: false,
+            focus_title: true,
+            schedule_h: 0.0,
+        }
+    }
+
+    pub fn from_task(t: &Task) -> Self {
+        let first = t.schedule.first_date();
+        let mut ed = Editor::new(first);
+        ed.task_id = Some(t.id);
+        ed.created_at = t.created_at;
+        ed.title = t.title.clone();
+        ed.notes = t.notes.clone();
+        ed.start_h = t.start_min / 60;
+        ed.start_m = t.start_min % 60;
+        ed.est_h = t.estimate_min / 60;
+        ed.est_m = t.estimate_min % 60;
+        ed.priority = t.priority;
+        ed.notify = t.notify;
+        ed.notify_ahead = t.notify_ahead_min;
+        ed.focus_title = false;
+        match t.schedule.clone().normalized() {
+            Schedule::Date { date, repeat } => {
+                ed.mode = Mode::Date;
+                ed.date = date;
+                ed.repeat = repeat;
+            }
+            Schedule::Weekdays { mask, from, every } => {
+                ed.mode = Mode::Weekdays;
+                ed.wd_mask = mask;
+                ed.wd_every = every;
+                ed.from = from;
+            }
+            Schedule::MonthDays { mask, from } => {
+                ed.mode = Mode::MonthDays;
+                ed.md_mask = mask;
+                ed.from = from;
+            }
+        }
+        ed
+    }
+
+    /// The recurring schedule as it would be if it started on `from` (None without days selected).
+    fn recurring_schedule(&self, from: NaiveDate) -> Option<Schedule> {
+        match self.mode {
+            Mode::Weekdays if self.wd_mask != 0 => Some(Schedule::Weekdays { mask: self.wd_mask, from, every: self.wd_every }),
+            Mode::MonthDays if self.md_mask != 0 => Some(Schedule::MonthDays { mask: self.md_mask, from }),
+            _ => None,
+        }
+    }
+
+    /// Whether the recurring schedule could start on `d` (it would be an occurrence).
+    fn can_start_on(&self, d: NaiveDate) -> bool {
+        self.recurring_schedule(d).is_none_or(|s| s.occurs_on(d))
+    }
+
+    /// First day on or after the picked start date that matches the selected days.
+    fn effective_from(&self) -> NaiveDate {
+        let mut d = self.from;
+        for _ in 0..800 {
+            if self.can_start_on(d) {
+                return d;
+            }
+            d += Duration::days(1);
+        }
+        self.from
+    }
+
+    fn to_task(&self) -> Result<Task, String> {
+        if self.title.trim().is_empty() {
+            return Err("Please enter a title.".into());
+        }
+        let schedule = match self.mode {
+            Mode::Date => Schedule::Date { date: self.date, repeat: self.repeat },
+            Mode::Weekdays if self.wd_mask == 0 => return Err("Select at least one weekday.".into()),
+            Mode::MonthDays if self.md_mask == 0 => return Err("Select at least one day of the month.".into()),
+            _ => self.recurring_schedule(self.effective_from()).unwrap(),
+        };
+        Ok(Task {
+            id: self.task_id.unwrap_or(0),
+            title: self.title.trim().to_string(),
+            notes: self.notes.clone(),
+            schedule,
+            start_min: self.start_h * 60 + self.start_m,
+            estimate_min: self.est_h * 60 + self.est_m,
+            priority: self.priority,
+            notify: self.notify,
+            notify_ahead_min: self.notify_ahead,
+            created_at: self.created_at,
+            deleted: false,
+        })
+    }
+}
+
+fn two_digit(v: f64, _: std::ops::RangeInclusive<usize>) -> String {
+    format!("{:02}", v as i64)
+}
+
+/// Font size of selector buttons and number fields in the editor (1.5 × body text).
+fn big_size(ui: &Ui) -> f32 {
+    ui.style().text_styles.get(&TextStyle::Body).map_or(12.5, |f| f.size) * 1.5
+}
+
+/// A selectable button that also shows its box when not selected.
+fn toggle<'a>(on: bool, text: impl Into<egui::WidgetText>) -> egui::Button<'a> {
+    egui::Button::selectable(on, text.into()).frame_when_inactive(true)
+}
+
+/// A toggle button with the big selector font.
+fn sel(ui: &mut Ui, on: bool, text: impl Into<String>) -> Response {
+    let size = big_size(ui);
+    ui.add(toggle(on, RichText::new(text).size(size)))
+}
+
+/// A line of small preset buttons below a field.
+fn presets(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().button_padding = egui::vec2(7.0, 1.0);
+        add(ui);
+    });
+}
+
+/// Number fields with the big font.
+fn big_numbers(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        let size = big_size(ui);
+        for style in [TextStyle::Body, TextStyle::Button, TextStyle::Monospace] {
+            ui.style_mut().text_styles.insert(style, FontId::proportional(size));
+        }
+        add(ui);
+    });
+}
+
+/// Always-open month calendar.
+fn calendar(
+    ui: &mut Ui,
+    salt: &str,
+    month: &mut NaiveDate,
+    value: &mut NaiveDate,
+    enabled: Option<&dyn Fn(NaiveDate) -> bool>,
+) {
+    ui.vertical(|ui| {
+        ui.set_width(CAL_W);
+        let mut sel = *value;
+        month_header(ui, month, &mut sel, false);
+        month_grid(ui, salt, *month, &mut sel, None, enabled, 30.0);
+        if sel != *value {
+            *value = sel;
+            if first_of_month(sel) != *month {
+                *month = first_of_month(sel);
+            }
+        }
+    });
+}
+
+const CAL_W: f32 = 380.0;
+const DAY_GAP: f32 = 4.0;
+/// Width of one day button, so a row of 7 is exactly as wide as the calendar.
+const DAY_BTN_W: f32 = (CAL_W - 6.0 * DAY_GAP) / 7.0;
+const LEFT_FIELD_W: f32 = 360.0;
+
+fn grid(ui: &Ui, id: &str) -> egui::Grid {
+    // rows are separated by half a line of the (big) selector text, on top of normal spacing
+    let row_gap = ui.spacing().item_spacing.y + big_size(ui) * 0.5;
+    egui::Grid::new(id).num_columns(2).spacing([16.0, row_gap]).min_row_height(big_size(ui) + 10.0)
+}
+
+fn row_label(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).color(Color32::from_gray(200)));
+}
+
+fn details_column(ui: &mut Ui, ed: &mut Editor) {
+    grid(ui, "editor-left").show(ui, |ui| {
+        row_label(ui, "Title");
+        let r = ui.add(egui::TextEdit::singleline(&mut ed.title).desired_width(LEFT_FIELD_W).hint_text("What needs doing?"));
+        if ed.focus_title {
+            r.request_focus();
+            ed.focus_title = false;
+        }
+        ui.end_row();
+
+        row_label(ui, "Notes");
+        ui.add(egui::TextEdit::multiline(&mut ed.notes).desired_rows(3).desired_width(LEFT_FIELD_W));
+        ui.end_row();
+
+        row_label(ui, "Start time");
+        ui.vertical(|ui| {
+            big_numbers(ui, |ui| {
+                ui.add(egui::DragValue::new(&mut ed.start_h).range(0..=23).speed(1.0 / DRAG_POINTS_PER_STEP).custom_formatter(two_digit));
+                ui.label(":");
+                ui.add(egui::DragValue::new(&mut ed.start_m).range(0..=59).speed(0.5 / DRAG_POINTS_PER_STEP).custom_formatter(two_digit));
+            });
+            presets(ui, |ui| {
+                for h in [7u32, 8, 9, 12, 14, 18, 20] {
+                    if ui.small_button(format!("{h:02}:00")).clicked() {
+                        ed.start_h = h;
+                        ed.start_m = 0;
+                    }
+                }
+            });
+        });
+        ui.end_row();
+
+        row_label(ui, "Estimated time");
+        ui.vertical(|ui| {
+            big_numbers(ui, |ui| {
+                ui.add(egui::DragValue::new(&mut ed.est_h).range(0..=23).speed(1.0 / DRAG_POINTS_PER_STEP).suffix(" h"));
+                ui.add(egui::DragValue::new(&mut ed.est_m).range(0..=59).speed(0.5 / DRAG_POINTS_PER_STEP).suffix(" min"));
+            });
+            presets(ui, |ui| {
+                for m in [5u32, 15, 30, 45, 60, 90, 120] {
+                    if ui.small_button(fmt_duration_min(m)).clicked() {
+                        ed.est_h = m / 60;
+                        ed.est_m = m % 60;
+                    }
+                }
+            });
+        });
+        ui.end_row();
+
+        row_label(ui, "Priority");
+        ui.horizontal_wrapped(|ui| {
+            let size = big_size(ui);
+            for p in Priority::ALL {
+                let txt = RichText::new(p.label()).size(size).color(if ed.priority == p { Color32::WHITE } else { p.color() });
+                if ui.add(toggle(ed.priority == p, txt)).clicked() {
+                    ed.priority = p;
+                }
+            }
+        });
+        ui.end_row();
+
+        row_label(ui, "Notification");
+        ui.horizontal_wrapped(|ui| {
+            for n in NotifyMode::ALL {
+                if sel(ui, ed.notify == n, format!("{} {}", n.icon(), n.label())).clicked() {
+                    ed.notify = n;
+                }
+            }
+        });
+        ui.end_row();
+
+        row_label(ui, "Notify ahead");
+        ui.vertical(|ui| {
+            big_numbers(ui, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut ed.notify_ahead)
+                        .range(0..=240)
+                        .speed(1.0 / DRAG_POINTS_PER_STEP)
+                        .custom_formatter(|v, _| if v < 0.5 { "Off".into() } else { format!("{v:.0} min") })
+                        .custom_parser(|s| {
+                            let s = s.trim().trim_end_matches("min").trim();
+                            if s.eq_ignore_ascii_case("off") { Some(0.0) } else { s.parse().ok() }
+                        }),
+                )
+                .on_hover_text("A short silent notice this many minutes before the start; closes after 10 s");
+                if ed.notify_ahead > 0 {
+                    ui.label(RichText::new("before the start").weak());
+                }
+            });
+            presets(ui, |ui| {
+                for m in [0u32, 5, 10, 15, 30, 60] {
+                    let label = if m == 0 { "Off".to_string() } else { fmt_duration_min(m) };
+                    if ui.small_button(label).clicked() {
+                        ed.notify_ahead = m;
+                    }
+                }
+            });
+        });
+        ui.end_row();
+    });
+}
+
+fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
+    // Follow the effective start date when changing the days moves it to another month.
+    let eff = ed.effective_from();
+    if eff != ed.last_from {
+        ed.last_from = eff;
+        ed.from_month = first_of_month(eff);
+    }
+    grid(ui, "editor-right").show(ui, |ui| {
+        row_label(ui, "Active on");
+        ui.horizontal(|ui| {
+            for (m, label) in [(Mode::Date, "Date"), (Mode::Weekdays, "Weekdays"), (Mode::MonthDays, "Month days")] {
+                if sel(ui, ed.mode == m, label).clicked() {
+                    ed.mode = m;
+                }
+            }
+        });
+        ui.end_row();
+
+        match ed.mode {
+            Mode::Date => {
+                row_label(ui, "Date");
+                calendar(ui, "date-cal", &mut ed.date_month, &mut ed.date, None);
+                ui.end_row();
+                row_label(ui, "Repeat");
+                ui.horizontal(|ui| {
+                    for r in Repeat::CHOICES {
+                        if sel(ui, ed.repeat == r, r.label()).clicked() {
+                            ed.repeat = r;
+                        }
+                    }
+                });
+                ui.end_row();
+            }
+            Mode::Weekdays => {
+                row_label(ui, "Days");
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = DAY_GAP;
+                        ui.spacing_mut().button_padding.x = 2.0;
+                        let size = big_size(ui);
+                        for (i, name) in WEEKDAY_SHORT.iter().enumerate() {
+                            let on = ed.wd_mask & (1 << i) != 0;
+                            let b = toggle(on, RichText::new(*name).size(size)).min_size(egui::vec2(DAY_BTN_W, 0.0));
+                            if ui.add(b).clicked() {
+                                ed.wd_mask ^= 1 << i;
+                            }
+                        }
+                    });
+                    presets(ui, |ui| {
+                        for (label, mask) in [("Mon–Fri", 0b001_1111), ("Weekend", 0b110_0000), ("Every day", 0b111_1111), ("Reset", 0)] {
+                            if ui.small_button(label).clicked() {
+                                ed.wd_mask = mask;
+                            }
+                        }
+                    });
+                });
+                ui.end_row();
+            }
+            Mode::MonthDays => {
+                row_label(ui, "Days");
+                ui.vertical(|ui| {
+                    let size = big_size(ui) * 0.85;
+                    egui::Grid::new("md-grid").spacing([DAY_GAP, DAY_GAP]).show(ui, |ui| {
+                        ui.spacing_mut().button_padding.x = 2.0;
+                        for d in 1..=31u32 {
+                            let on = ed.md_mask & (1 << d) != 0;
+                            let b = toggle(on, RichText::new(d.to_string()).size(size)).min_size(egui::vec2(DAY_BTN_W, 28.0));
+                            if ui.add(b).clicked() {
+                                ed.md_mask ^= 1 << d;
+                            }
+                            if d % 7 == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                    presets(ui, |ui| {
+                        for (label, mask) in [("1st", 1u32 << 1), ("1st + 15th", (1 << 1) | (1 << 15)), ("Reset", 0)] {
+                            if ui.small_button(label).clicked() {
+                                ed.md_mask = mask;
+                            }
+                        }
+                    });
+                });
+                ui.end_row();
+            }
+        }
+
+        if ed.mode != Mode::Date {
+            row_label(ui, "Starting");
+            ui.vertical(|ui| {
+                let mut shown = eff;
+                let mut month = ed.from_month;
+                let check = |d: NaiveDate| ed.can_start_on(d);
+                calendar(ui, "from-cal", &mut month, &mut shown, Some(&check));
+                ed.from_month = month;
+                if shown != eff {
+                    ed.from = shown;
+                    ed.last_from = shown;
+                }
+            });
+            ui.end_row();
+        }
+        // Repeat comes after the calendar, like in the date view.
+        match ed.mode {
+            Mode::Date => {}
+            Mode::Weekdays => {
+                row_label(ui, "Repeat");
+                egui::Grid::new("wd-every").spacing([DAY_GAP, DAY_GAP]).show(ui, |ui| {
+                    let size = big_size(ui);
+                    for (i, r) in WeekRepeat::ALL.into_iter().enumerate() {
+                        let b = toggle(ed.wd_every == r, RichText::new(r.label()).size(size))
+                            .min_size(egui::vec2((CAL_W - DAY_GAP) / 2.0, 0.0));
+                        if ui.add(b).clicked() {
+                            ed.wd_every = r;
+                        }
+                        if i % 2 == 1 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                ui.end_row();
+                if ed.wd_every == WeekRepeat::BiWeekly {
+                    row_label(ui, "");
+                    ui.label(RichText::new("Every 2 weeks, counted from the starting day's week.").small().weak());
+                    ui.end_row();
+                }
+            }
+            Mode::MonthDays => {
+                row_label(ui, "Repeat");
+                ui.label(RichText::new("Every month. Months without a selected day skip it.").weak());
+                ui.end_row();
+            }
+        }
+    });
+}
+
+pub fn editor_ui(ctx: &egui::Context, ed: &mut Editor) -> EditorResult {
+    let mut result = EditorResult::Open;
+    // Anchored at the top so a taller schedule only extends the dialog downwards.
+    let top = ((ctx.content_rect().height() - 700.0) / 2.0).max(10.0);
+    let area = Modal::default_area(Id::unique("task-editor")).anchor(Align2::CENTER_TOP, egui::vec2(0.0, top));
+    let modal = Modal::new(Id::unique("task-editor")).area(area).show(ctx, |ui| {
+        ui.heading(if ed.task_id.is_some() { "Edit task" } else { "New task" });
+        if ed.task_id.is_some() {
+            ui.label(
+                RichText::new("Changes apply to the task plan. Occurrences that were already started keep their data.")
+                    .small()
+                    .weak(),
+            );
+        }
+        ui.add_space(8.0);
+        let cols = ui.horizontal_top(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+            let left = ui.vertical(|ui| details_column(ui, ed)).response.rect;
+            ui.add_space(28.0);
+            ui.vertical(|ui| {
+                ui.set_min_height(ed.schedule_h);
+                schedule_column(ui, ed);
+                ed.schedule_h = ed.schedule_h.max(ui.min_rect().height());
+            });
+            left.right() + 14.0
+        });
+        let r = cols.response.rect;
+        ui.painter().vline(cols.inner, r.y_range(), ui.visuals().widgets.noninteractive.bg_stroke);
+
+        if let Some(err) = &ed.error {
+            ui.colored_label(Color32::from_rgb(240, 110, 100), err);
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            let save = egui::Button::new(RichText::new("Save").strong().color(Color32::WHITE)).fill(Color32::from_rgb(52, 92, 160));
+            if ui.add(save).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl) {
+                match ed.to_task() {
+                    Ok(t) => result = EditorResult::Save(t),
+                    Err(e) => ed.error = Some(e),
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                result = EditorResult::Cancel;
+            }
+            if let Some(id) = ed.task_id {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ed.confirm_delete {
+                        if ui.button(RichText::new("Really delete").color(Color32::from_rgb(240, 110, 100))).clicked() {
+                            result = EditorResult::Delete(id);
+                        }
+                        ui.label(RichText::new("History is kept.").small().weak());
+                    } else if ui.button("🗑 Delete task").clicked() {
+                        ed.confirm_delete = true;
+                    }
+                });
+            }
+        });
+    });
+    if modal.should_close() && matches!(result, EditorResult::Open) {
+        result = EditorResult::Cancel;
+    }
+    result
+}
+
+// ============================================================================ statistics
+
+/// The statistics show at most this many (most recent) occurrences.
+const STATS_MAX_POINTS: usize = 30;
+
+struct Point {
+    date: NaiveDate,
+    tracked_min: Option<f32>,
+    estimate_min: u32,
+    delay_min: Option<i64>,
+    done: bool,
+}
+
+fn stats_points(store: &Store, task: &Task) -> Vec<Point> {
+    let today = Local::now().date_naive();
+    let runs: Vec<&Run> = store.runs.iter().filter(|r| r.task_id == task.id).collect();
+    let start = runs
+        .iter()
+        .map(|r| r.date)
+        .chain([task.schedule.first_date()])
+        .min()
+        .unwrap()
+        .max(today - Duration::days(400));
+    let now = Local::now().timestamp();
+    let mut pts = Vec::new();
+    let mut d = start;
+    while d <= today {
+        let run = runs.iter().find(|r| r.date == d);
+        if run.is_some() || task.schedule.occurs_on(d) {
+            let p = match run {
+                Some(r) => {
+                    // Same rounding as the "started 5 min late" labels.
+                    let delay = r.first_start().map(|s| minutes_from_start(d, r.start_min, s));
+                    Point {
+                        date: d,
+                        tracked_min: Some(r.tracked_secs(now) as f32 / 60.0),
+                        estimate_min: r.estimate_min,
+                        delay_min: delay,
+                        done: r.status == RunStatus::Done,
+                    }
+                }
+                None => Point { date: d, tracked_min: None, estimate_min: task.estimate_min, delay_min: None, done: false },
+            };
+            // today's not-yet-started occurrence isn't "missed" yet
+            if !(d == today && p.tracked_min.is_none()) {
+                pts.push(p);
+            }
+        }
+        d += Duration::days(1);
+    }
+    let skip = pts.len().saturating_sub(STATS_MAX_POINTS);
+    pts.into_iter().skip(skip).collect()
+}
+
+/// Returns false when closed.
+pub enum ListResult {
+    Open,
+    Close,
+    Edit(i64),
+}
+
+/// One task in the task list: priority bar, title, an info line and an Edit button.
+/// Returns true when Edit was clicked.
+fn task_list_row(ui: &mut Ui, t: &Task, info: &str, info_color: Color32) -> bool {
+    let mut edit = false;
+    egui::Frame::new()
+        .fill(Color32::from_gray(40))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (bar, _) = ui.allocate_exact_size(egui::vec2(4.0, 38.0), Sense::hover());
+                ui.painter().rect_filled(bar, 2.0, t.priority.color());
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(&t.title).strong().size(15.0));
+                    ui.label(RichText::new(info).size(12.5).color(info_color));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    edit = ui.button("✏ Edit").clicked();
+                });
+            });
+        });
+    ui.add_space(4.0);
+    edit
+}
+
+/// All tasks in two lists: recurring tasks, and one-off tasks that haven't been started
+/// yet (started ones are done with planning). One line each, with an edit button.
+pub fn task_list_ui(ctx: &egui::Context, store: &Store) -> ListResult {
+    let mut res = ListResult::Open;
+    let mut recurring: Vec<&Task> = store.tasks.iter().filter(|t| !t.deleted && t.schedule.is_recurring()).collect();
+    recurring.sort_by_key(|t| (t.start_min, t.title.to_lowercase()));
+    let started: std::collections::HashSet<i64> = store.runs.iter().map(|r| r.task_id).collect();
+    let mut one_off: Vec<&Task> = store
+        .tasks
+        .iter()
+        .filter(|t| !t.deleted && !t.schedule.is_recurring() && !started.contains(&t.id))
+        .collect();
+    one_off.sort_by_key(|t| (t.schedule.first_date(), t.start_min, t.title.to_lowercase()));
+    let today = Local::now().date_naive();
+    let screen = ctx.content_rect().size();
+    let span = |t: &Task| {
+        let end = (t.start_min + t.estimate_min).min(24 * 60);
+        format!("{} – {}   ·   est. {}", fmt_hm(t.start_min), fmt_hm(end), fmt_duration_min(t.estimate_min))
+    };
+    let section = |ui: &mut Ui, title: &str, n: usize| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).strong().size(16.0));
+            ui.label(RichText::new(n.to_string()).weak());
+        });
+        ui.add_space(2.0);
+    };
+    let modal = Modal::new(Id::unique("task-list")).show(ctx, |ui| {
+        ui.set_width(640.0_f32.min(screen.x - 60.0).max(200.0));
+        ui.horizontal(|ui| {
+            ui.heading("☰ Tasks");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Close").clicked() {
+                    res = ListResult::Close;
+                }
+            });
+        });
+        ui.add_space(6.0);
+        // The modal is sized from the previous frame; ask for the list's full height (as
+        // measured last frame) so it doesn't stay at its first, too small, size.
+        let h_id = Id::unique("task-list-height");
+        let max_h = (screen.y - 160.0).max(80.0);
+        let last_h = ui.ctx().data(|d| d.get_temp::<f32>(h_id)).unwrap_or(0.0);
+        let list = egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(last_h.min(max_h)).show(ui, |ui| {
+            section(ui, "⟳ Recurring", recurring.len());
+            if recurring.is_empty() {
+                ui.label(RichText::new("No recurring tasks.").weak());
+            }
+            for t in &recurring {
+                let mut info = format!("{}   ·   {}", t.schedule.describe(), span(t));
+                let first = t.schedule.first_date();
+                if first > today {
+                    info.push_str(&format!("   ·   from {}", first.format("%d.%m.%Y")));
+                }
+                if task_list_row(ui, t, &info, Color32::from_gray(170)) {
+                    res = ListResult::Edit(t.id);
+                }
+            }
+            ui.add_space(10.0);
+            section(ui, "One-off, not started", one_off.len());
+            if one_off.is_empty() {
+                ui.label(RichText::new("No open one-off tasks.").weak());
+            }
+            for t in &one_off {
+                let date = t.schedule.first_date();
+                let mut info = format!("{}   ·   {}", date.format("%a %d.%m.%Y"), span(t));
+                let color = if date < today {
+                    info.push_str("   ·   (past)");
+                    Color32::from_rgb(220, 150, 90)
+                } else {
+                    Color32::from_gray(170)
+                };
+                if task_list_row(ui, t, &info, color) {
+                    res = ListResult::Edit(t.id);
+                }
+            }
+        });
+        ui.ctx().data_mut(|d| d.insert_temp(h_id, list.content_size.y));
+    });
+    if modal.should_close() && matches!(res, ListResult::Open) {
+        res = ListResult::Close;
+    }
+    res
+}
+
+pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
+    let Some(task) = store.task(task_id) else { return false };
+    let pts = stats_points(store, task);
+    let mut open = true;
+    let modal = Modal::new(Id::unique("stats")).show(ctx, |ui| {
+        ui.set_width(680.0);
+        ui.horizontal(|ui| {
+            ui.heading(format!("📊 {}", task.title));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Close").clicked() {
+                    open = false;
+                }
+            });
+        });
+        ui.label(RichText::new(format!("{} at {} · estimate {}", task.schedule.describe(), fmt_hm(task.start_min), fmt_duration_min(task.estimate_min))).weak());
+        ui.add_space(6.0);
+
+        if pts.is_empty() {
+            ui.label("No past occurrences yet.");
+            return;
+        }
+        // ---- numbers
+        let n = pts.len();
+        let started: Vec<&Point> = pts.iter().filter(|p| p.tracked_min.is_some()).collect();
+        let done = pts.iter().filter(|p| p.done).count();
+        let avg = |v: &[f32]| if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 };
+        let tracked: Vec<f32> = started.iter().filter_map(|p| p.tracked_min).collect();
+        let delays: Vec<i64> = started.iter().filter_map(|p| p.delay_min).collect();
+        let on_time = delays.iter().filter(|&&d| d <= 5).count();
+        let over = started.iter().filter(|p| p.tracked_min.unwrap_or(0.0) > p.estimate_min as f32).count();
+        egui::Grid::new("stats-grid").num_columns(4).spacing([24.0, 4.0]).show(ui, |ui| {
+            let kv = |ui: &mut Ui, k: &str, v: String| {
+                ui.label(RichText::new(k).weak());
+                ui.label(RichText::new(v).strong());
+            };
+            kv(ui, "Occurrences", if n >= STATS_MAX_POINTS { format!("last {n}") } else { n.to_string() });
+            kv(ui, "Started / done", format!("{} / {}  ({:.0}% done)", started.len(), done, done as f32 * 100.0 / n as f32));
+            ui.end_row();
+            kv(ui, "Avg. tracked", fmt_duration_min(avg(&tracked).round() as u32));
+            kv(ui, "Over estimate", format!("{over} of {}", started.len()));
+            ui.end_row();
+            kv(
+                ui,
+                "Started on time",
+                if delays.is_empty() { "–".into() } else { format!("{on_time} of {} (≤ 5 min late)", delays.len()) },
+            );
+            let avg_delay = if delays.is_empty() { 0.0 } else { delays.iter().sum::<i64>() as f32 / delays.len() as f32 };
+            kv(ui, "Avg. start delay", if delays.is_empty() { "–".into() } else { format!("{avg_delay:+.0} min") });
+            ui.end_row();
+            kv(ui, "Total tracked", fmt_duration_min(tracked.iter().sum::<f32>().round() as u32));
+            ui.end_row();
+        });
+        ui.add_space(10.0);
+
+        // ---- bar chart
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 240.0), Sense::hover());
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 4.0, Color32::from_gray(28));
+        let plot = Rect::from_min_max(rect.min + egui::vec2(44.0, 12.0), rect.max - egui::vec2(10.0, 34.0));
+        let max_v = pts
+            .iter()
+            .map(|p| p.tracked_min.unwrap_or(0.0).max(p.estimate_min as f32))
+            .fold(task.estimate_min.max(1) as f32, f32::max)
+            * 1.15;
+        let y_of = |v: f32| plot.bottom() - plot.height() * (v / max_v);
+        for k in 0..=4 {
+            let v = max_v * k as f32 / 4.0;
+            let y = y_of(v);
+            p.hline(plot.x_range(), y, Stroke::new(1.0, Color32::from_gray(48)));
+            p.text(egui::pos2(plot.left() - 6.0, y), Align2::RIGHT_CENTER, format!("{:.0}m", v), FontId::proportional(10.0), Color32::from_gray(150));
+        }
+        let slot = plot.width() / n as f32;
+        let bw = (slot * 0.62).min(36.0);
+        let mut est_line: Vec<egui::Pos2> = Vec::new();
+        let changed_estimate = pts.iter().any(|p| p.estimate_min != task.estimate_min);
+        let label_every = ((n as f32 * 44.0 / plot.width()).ceil() as usize).max(1);
+        for (i, pt) in pts.iter().enumerate() {
+            let cx = plot.left() + slot * (i as f32 + 0.5);
+            let ey = y_of(pt.estimate_min as f32);
+            est_line.push(egui::pos2(cx - slot / 2.0, ey));
+            est_line.push(egui::pos2(cx + slot / 2.0, ey));
+            let bar_rect;
+            match pt.tracked_min {
+                Some(v) => {
+                    let col = if v <= pt.estimate_min as f32 { Color32::from_rgb(80, 160, 105) } else { Color32::from_rgb(220, 130, 60) };
+                    bar_rect = Rect::from_min_max(egui::pos2(cx - bw / 2.0, y_of(v).min(plot.bottom() - 1.0)), egui::pos2(cx + bw / 2.0, plot.bottom()));
+                    p.rect_filled(bar_rect, 2.0, if pt.done { col } else { col.gamma_multiply(0.6) });
+                }
+                None => {
+                    bar_rect = Rect::from_center_size(egui::pos2(cx, plot.bottom() - 8.0), egui::vec2(bw, 16.0));
+                    p.text(bar_rect.center(), Align2::CENTER_CENTER, "✕", FontId::proportional(12.0), Color32::from_rgb(210, 80, 80));
+                }
+            }
+            // punctuality dot
+            let dot = match pt.delay_min {
+                Some(d) if d <= 5 => Color32::from_rgb(90, 190, 110),
+                Some(d) if d <= 30 => Color32::from_rgb(225, 190, 70),
+                Some(_) => Color32::from_rgb(225, 100, 70),
+                None => Color32::from_gray(70),
+            };
+            p.circle_filled(egui::pos2(cx, plot.bottom() + 7.0), 3.0, dot);
+            if i % label_every == 0 {
+                p.text(egui::pos2(cx, plot.bottom() + 14.0), Align2::CENTER_TOP, pt.date.format("%d.%m.").to_string(), FontId::proportional(10.0), Color32::from_gray(150));
+            }
+            let hover = Rect::from_x_y_ranges(cx - slot / 2.0..=cx + slot / 2.0, plot.y_range());
+            let tip = match pt.tracked_min {
+                Some(v) => format!(
+                    "{}\ntracked {} / est. {}{}\nstarted {}\n{}",
+                    pt.date.format("%a %d.%m.%Y"),
+                    fmt_duration_min(v.round() as u32),
+                    fmt_duration_min(pt.estimate_min),
+                    if pt.estimate_min != task.estimate_min {
+                        format!(" (at the time; now {})", fmt_duration_min(task.estimate_min))
+                    } else {
+                        String::new()
+                    },
+                    pt.delay_min.map(|d| if d <= 0 { format!("{} min early", -d) } else { format!("{d} min late") }).unwrap_or_default(),
+                    if pt.done { "done" } else { "not finished" }
+                ),
+                None => format!("{}\nmissed (not started)", pt.date.format("%a %d.%m.%Y")),
+            };
+            ui.interact(hover, Id::unique(("stat-bar", i)), Sense::hover()).on_hover_text(tip);
+            let _ = bar_rect;
+        }
+        // Started occurrences keep the estimate they had when started (dashed, only where it
+        // differs); the solid line is the task's current estimate.
+        let cur_col = Color32::from_rgb(200, 200, 230);
+        let old_col = Color32::from_rgb(170, 140, 220);
+        if changed_estimate {
+            p.add(egui::Shape::dashed_line(&est_line, Stroke::new(1.5, old_col), 6.0, 4.0));
+        }
+        p.hline(plot.x_range(), y_of(task.estimate_min as f32), Stroke::new(1.5, cur_col));
+        ui.horizontal(|ui| {
+            let legend = |ui: &mut Ui, c: Color32, t: &str| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                ui.painter().rect_filled(r, 2.0, c);
+                ui.label(RichText::new(t).small());
+            };
+            legend(ui, Color32::from_rgb(80, 160, 105), "within estimate");
+            legend(ui, Color32::from_rgb(220, 130, 60), "over estimate");
+            legend(ui, cur_col, "— current estimate");
+            if changed_estimate {
+                legend(ui, old_col, "- - estimate when started");
+            }
+            ui.label(RichText::new("✕ missed   ● on time / late (dot below bar)").small().weak());
+        });
+    });
+    if modal.should_close() {
+        open = false;
+    }
+    open
+}
+
+// ============================================================================ settings
+
+pub struct SettingsDialog {
+    draft: Settings,
+    browse_result: Arc<Mutex<Option<String>>>,
+    new_snooze: u32,
+    /// UI scale slider value in percent (applied to `draft` on release).
+    scale_pct: u32,
+}
+
+impl SettingsDialog {
+    pub fn new(s: Settings) -> Self {
+        let scale_pct = (s.ui_scale * 100.0).round() as u32;
+        SettingsDialog { draft: s, browse_result: Arc::new(Mutex::new(None)), new_snooze: 15, scale_pct }
+    }
+    /// The UI scale being previewed.
+    pub fn ui_scale(&self) -> f32 {
+        self.draft.ui_scale
+    }
+    pub fn set_ui_scale(&mut self, f: f32) {
+        self.draft.ui_scale = f;
+        self.scale_pct = (f * 100.0).round() as u32;
+    }
+}
+
+pub enum SettingsResult {
+    Open,
+    Cancel,
+    Save(Settings),
+    TestSound(Settings),
+    StopSound,
+}
+
+pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio) -> SettingsResult {
+    let mut result = SettingsResult::Open;
+    if let Some(path) = dlg.browse_result.lock().ok().and_then(|mut r| r.take()) {
+        dlg.draft.sound_file = path;
+        dlg.draft.sound = SoundChoice::File;
+    }
+    let s = &mut dlg.draft;
+    // At large UI scales the dialog may not fit the window: scroll the settings, keep
+    // Save / Cancel visible.
+    let screen = ctx.content_rect().size();
+    let modal = Modal::new(Id::unique("settings")).show(ctx, |ui| {
+        ui.heading("⚙ Settings");
+        ui.add_space(6.0);
+        // As wide as the content needs; only the height is limited (vertical scrolling).
+        egui::ScrollArea::vertical().max_height((screen.y - 150.0).max(80.0)).show(ui, |ui| {
+            egui::Grid::new("settings-grid").num_columns(2).spacing([14.0, 12.0]).show(ui, |ui| {
+                ui.label("Notification corner");
+                egui::Grid::new("corner").spacing([4.0, 4.0]).show(ui, |ui| {
+                    ui.selectable_value(&mut s.corner, Corner::TopLeft, "↖ Top left");
+                    ui.selectable_value(&mut s.corner, Corner::TopRight, "↗ Top right");
+                    ui.end_row();
+                    ui.selectable_value(&mut s.corner, Corner::BottomLeft, "↙ Bottom left");
+                    ui.selectable_value(&mut s.corner, Corner::BottomRight, "↘ Bottom right");
+                    ui.end_row();
+                });
+                ui.end_row();
+
+                ui.label("Snooze options");
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let mut remove = None;
+                        for (i, m) in s.snooze_minutes.iter().enumerate() {
+                            if ui.button(format!("{}  ✕", fmt_snooze(*m))).on_hover_text("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                        }
+                        if let Some(i) = remove {
+                            s.snooze_minutes.remove(i);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut dlg.new_snooze).range(1..=24 * 60).speed(1.0 / DRAG_POINTS_PER_STEP).suffix(" min"));
+                        if ui.button("Add").clicked() && !s.snooze_minutes.contains(&dlg.new_snooze) {
+                            s.snooze_minutes.push(dlg.new_snooze);
+                            s.snooze_minutes.sort_unstable();
+                        }
+                        if ui.small_button("Reset").clicked() {
+                            s.snooze_minutes = DEFAULT_SNOOZE.to_vec();
+                        }
+                    });
+                });
+                ui.end_row();
+
+                ui.label("Sound");
+                ui.vertical(|ui| {
+                    egui::ComboBox::from_id_salt("sound").selected_text(s.sound.label()).width(200.0).show_ui(ui, |ui| {
+                        for c in SoundChoice::ALL {
+                            ui.selectable_value(&mut s.sound, c, c.label());
+                        }
+                    });
+                    if s.sound == SoundChoice::File {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut s.sound_file).desired_width(300.0).hint_text("path of a sound file"));
+                            if platform::can_pick_file() && ui.button("Browse…").clicked() {
+                                let out = dlg.browse_result.clone();
+                                let ctx = ctx.clone();
+                                std::thread::spawn(move || {
+                                    if let Some(p) = platform::pick_sound_file() {
+                                        if let Ok(mut r) = out.lock() {
+                                            *r = Some(p);
+                                        }
+                                        ctx.request_repaint();
+                                    }
+                                });
+                            }
+                        });
+                        ui.label(RichText::new("WAV, MP3, OGG/Vorbis or FLAC").small().weak());
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Volume ramp");
+                ui.vertical(|ui| {
+                    ui.add(egui::Slider::new(&mut s.start_volume, 0.0..=1.0).text("start volume").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                    ui.add(egui::Slider::new(&mut s.end_volume, 0.0..=1.0).text("end volume").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                    ui.add(egui::Slider::new(&mut s.ramp_secs, 0.0..=300.0).text("ramp time").suffix(" s"));
+                    ui.horizontal(|ui| {
+                        if ui.button("▶ Test").clicked() {
+                            result = SettingsResult::TestSound(s.clone());
+                        }
+                        if ui.button("■ Stop").clicked() {
+                            result = SettingsResult::StopSound;
+                        }
+                    });
+                    if let Some(err) = audio.error() {
+                        ui.colored_label(Color32::from_rgb(240, 130, 100), format!("⚠ {err}"));
+                    }
+                });
+                ui.end_row();
+
+                ui.label("UI scale");
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().slider_width = 230.0;
+                        let slider = egui::Slider::new(&mut dlg.scale_pct, UI_SCALE_PCT).suffix(" %").logarithmic(true);
+                        let r = ui.add(slider);
+                        // Rescaling while dragging would move the slider away under the mouse,
+                        // so the preview is applied on release (or after typing a value).
+                        if (r.changed() && !r.dragged()) || r.drag_stopped() {
+                            s.ui_scale = dlg.scale_pct as f32 / 100.0;
+                        }
+                        if ui.small_button("Reset to 100 %").clicked() {
+                            dlg.scale_pct = 100;
+                            s.ui_scale = 1.0;
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Applied when you release the slider; click the number to type a value. Also: Ctrl + / Ctrl − / Ctrl 0.")
+                            .small()
+                            .weak(),
+                    );
+                });
+                ui.end_row();
+
+                ui.label("Window");
+                ui.vertical(|ui| {
+                    ui.checkbox(&mut s.close_to_tray, "Close button minimizes to the panel instead of quitting");
+                    ui.checkbox(&mut s.start_minimized, "Start minimized to the panel (or start with --minimized)");
+                });
+                ui.end_row();
+            });
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            let save = egui::Button::new(RichText::new("Save").strong().color(Color32::WHITE)).fill(Color32::from_rgb(52, 92, 160));
+            if ui.add(save).clicked() {
+                result = SettingsResult::Save(s.clone());
+            }
+            if ui.button("Cancel").clicked() {
+                result = SettingsResult::Cancel;
+            }
+        });
+    });
+    if modal.should_close() && matches!(result, SettingsResult::Open) {
+        result = SettingsResult::Cancel;
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn d(m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, m, day).unwrap()
+    }
+
+    fn editor(title: &str) -> Editor {
+        let mut ed = Editor::new(d(11, 6));
+        ed.title = title.into();
+        ed
+    }
+
+    #[test]
+    fn editor_validation() {
+        let mut ed = editor("   ");
+        assert!(ed.to_task().is_err(), "blank title");
+        ed.title = "  Gym  ".into();
+        let t = ed.to_task().unwrap();
+        assert_eq!(t.title, "Gym", "title is trimmed");
+        assert_eq!(t.schedule, Schedule::Date { date: d(11, 6), repeat: Repeat::Never });
+        ed.mode = Mode::Weekdays;
+        assert!(ed.to_task().is_err(), "weekdays without a day");
+        ed.mode = Mode::MonthDays;
+        assert!(ed.to_task().is_err(), "month days without a day");
+    }
+
+    #[test]
+    fn start_date_snaps_to_the_first_matching_day() {
+        let mut ed = editor("Standup");
+        ed.mode = Mode::Weekdays;
+        ed.wd_mask = 0b001_1111; // Mon–Fri
+        ed.from = d(11, 7); // a Saturday
+        assert!(!ed.can_start_on(d(11, 7)));
+        assert!(ed.can_start_on(d(11, 9)));
+        assert_eq!(ed.effective_from(), d(11, 9), "the next Monday");
+        let t = ed.to_task().unwrap();
+        assert_eq!(t.schedule, Schedule::Weekdays { mask: 0b001_1111, from: d(11, 9), every: WeekRepeat::Weekly });
+
+        ed.mode = Mode::MonthDays;
+        ed.md_mask = 1 << 31;
+        ed.from = d(11, 1);
+        assert_eq!(ed.effective_from(), d(12, 31), "November has no 31st");
+    }
+
+    #[test]
+    fn editing_keeps_everything() {
+        // 30 Jan 2026 is the last Friday of January (saved tasks always start on an occurrence)
+        let mut t = test_task("Retro", Schedule::Weekdays { mask: 1 << 4, from: d(1, 30), every: WeekRepeat::LastInMonth }, 15 * 60 + 30, 75);
+        t.id = 42;
+        t.notes = "bring cake".into();
+        t.priority = Priority::Urgent;
+        t.notify = NotifyMode::Silent;
+        t.notify_ahead_min = 15;
+        t.created_at = 123;
+        let back = Editor::from_task(&t).to_task().unwrap();
+        assert_eq!(back.id, 42);
+        assert_eq!(back.schedule, t.schedule);
+        assert_eq!((back.start_min, back.estimate_min), (t.start_min, t.estimate_min));
+        assert_eq!((back.priority, back.notify, back.notify_ahead_min), (t.priority, t.notify, 15));
+        assert_eq!((back.notes.as_str(), back.created_at), ("bring cake", 123));
+    }
+
+    #[test]
+    fn statistics_points() {
+        let today = Local::now().date_naive();
+        let mut s = Store::open(Path::new(":memory:")).unwrap();
+        let from = today - Duration::days(4);
+        let id = s.save_task(test_task("Mail", Schedule::Weekdays { mask: 0b111_1111, from, every: WeekRepeat::Weekly }, 8 * 60, 30)).unwrap();
+        // day 1 started 5 min late and worked 20 min; days 2 and 3 missed; today not started
+        let late = scheduled_at(from + Duration::days(1), 8 * 60 + 5).and_local_timezone(Local).unwrap().timestamp();
+        let run = s.start(id, from + Duration::days(1), late).unwrap();
+        s.finish(run, late + 20 * 60).unwrap();
+        let pts = stats_points(&s, s.task(id).unwrap());
+        assert_eq!(pts.iter().map(|p| p.date).collect::<Vec<_>>(), (0..4).map(|i| from + Duration::days(i)).collect::<Vec<_>>(), "today isn't missed yet");
+        assert_eq!(pts[1].tracked_min, Some(20.0));
+        assert_eq!(pts[1].delay_min, Some(5));
+        assert!(pts[1].done);
+        assert!(pts[0].tracked_min.is_none() && pts[2].tracked_min.is_none(), "missed days");
+    }
+}

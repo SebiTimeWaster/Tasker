@@ -1,0 +1,34 @@
+{
+    // Ctrl+Shift+B: release builds for Linux and Windows into binary/ (see README).
+    // The debug build: Ctrl+Shift+P → "Tasks: Run Task".
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo build-all",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["build-all"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "clear": true
+            }
+        },
+        {
+            "label": "cargo build (debug)",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["build"],
+            "group": "build",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "clear": true
+            }
+        }
+    ]
+}
