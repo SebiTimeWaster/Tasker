@@ -1,0 +1,4 @@
+# Matches how the code was already written: lines up to 120 columns, and short things
+# (struct literals, if/else, call chains) stay on one line while they fit.
+max_width = 120
+use_small_heuristics = "Max"

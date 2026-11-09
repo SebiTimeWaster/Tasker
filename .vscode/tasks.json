@@ -1,18 +1,17 @@
 {
-    // Ctrl+Shift+B: release builds for Linux and Windows into binary/ (see README).
-    // The debug build: Ctrl+Shift+P → "Tasks: Run Task".
+    // Ctrl+Shift+B: release build (target/release). The debug build: Ctrl+Shift+P → "Tasks: Run Task".
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "cargo build-all",
+            "label": "cargo build --release",
             "type": "shell",
             "command": "cargo",
-            "args": ["build-all"],
+            "args": ["build", "--release"],
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "problemMatcher": [],
+            "problemMatcher": ["$rustc"],
             "presentation": {
                 "reveal": "always",
                 "clear": true
@@ -24,7 +23,7 @@
             "command": "cargo",
             "args": ["build"],
             "group": "build",
-            "problemMatcher": [],
+            "problemMatcher": ["$rustc"],
             "presentation": {
                 "reveal": "always",
                 "clear": true

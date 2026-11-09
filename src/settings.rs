@@ -105,7 +105,7 @@ impl Default for Settings {
 }
 
 pub fn fmt_snooze(min: u32) -> String {
-    if min >= 60 && min % 60 == 0 { format!("{} h", min / 60) } else { format!("{min} min") }
+    if min >= 60 && min.is_multiple_of(60) { format!("{} h", min / 60) } else { format!("{min} min") }
 }
 
 #[cfg(test)]

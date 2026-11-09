@@ -17,7 +17,7 @@ pub fn session_info() -> String {
 
 /// Show `println!` output when started from a console (the exe has no console of its own).
 pub fn attach_console() {
-    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
     // SAFETY: plain Win32 call; failure (no parent console) is harmless.
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }
@@ -76,13 +76,18 @@ impl Screen {
             if unsafe { GetMonitorInfoW(mon, &mut mi) } != 0 {
                 let r = mi.rcWork;
                 const MONITORINFOF_PRIMARY: u32 = 1;
-                list.push((mi.dwFlags & MONITORINFOF_PRIMARY != 0, (r.left, r.top, r.right - r.left, r.bottom - r.top)));
+                list.push((
+                    mi.dwFlags & MONITORINFOF_PRIMARY != 0,
+                    (r.left, r.top, r.right - r.left, r.bottom - r.top),
+                ));
             }
             1 // continue
         }
         let mut list: Vec<(bool, Area)> = Vec::new();
         // SAFETY: the callback only touches `list`, which outlives the call.
-        unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(add), &mut list as *mut _ as LPARAM) };
+        unsafe {
+            EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(add), &mut list as *mut _ as LPARAM)
+        };
         list.sort_by_key(|(primary, _)| !primary);
         list.into_iter().map(|(_, a)| a).collect()
     }

@@ -1,9 +1,9 @@
 //! Notification-area icon (via the `tray-icon` crate). Left click shows / hides the
 //! window, right click opens the menu from [`crate::tray::menu`].
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -56,10 +56,8 @@ impl Tray {
                 send2(m);
             }
         }));
-        let mut b = TrayIconBuilder::new()
-            .with_tooltip("Tasker")
-            .with_menu(Box::new(menu(&[])))
-            .with_menu_on_left_click(false);
+        let mut b =
+            TrayIconBuilder::new().with_tooltip("Tasker").with_menu(Box::new(menu(&[]))).with_menu_on_left_click(false);
         if let Some(i) = icon(IconState::Idle) {
             b = b.with_icon(i);
         }

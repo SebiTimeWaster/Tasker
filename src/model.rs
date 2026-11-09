@@ -5,15 +5,7 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use serde::{Deserialize, Serialize};
 
 pub const WEEKDAY_SHORT: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-pub const WEEKDAY_LONG: [&str; 7] = [
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-    "Sunday",
-];
+pub const WEEKDAY_LONG: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
 /// Repetition of a single-date schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,7 +128,9 @@ impl Schedule {
             Schedule::Date { date, repeat: Repeat::Weekly } => {
                 Schedule::Weekdays { mask: 1 << weekday_index(date), from: date, every: WeekRepeat::Weekly }
             }
-            Schedule::Date { date, repeat: Repeat::Monthly } => Schedule::MonthDays { mask: 1 << date.day(), from: date },
+            Schedule::Date { date, repeat: Repeat::Monthly } => {
+                Schedule::MonthDays { mask: 1 << date.day(), from: date }
+            }
             s => s,
         }
     }

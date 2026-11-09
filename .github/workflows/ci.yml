@@ -1,0 +1,57 @@
+# Runs on every push to main and on pull requests:
+#   check: formatting, lints (for the Linux and the Windows code), tests, and tasker.exe
+#   linux: the Linux binary, built on AlmaLinux 9 so that glibc 2.34 is enough to run it
+# Both binaries can be downloaded from the run's page (Artifacts).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust, and MinGW to build for Windows
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt --target x86_64-pc-windows-gnu
+          rustup default stable
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked --target x86_64-pc-windows-gnu
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tasker-windows
+          path: target/x86_64-pc-windows-gnu/release/tasker.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    # A binary needs at least the glibc it was built with, so build with an old one.
+    container: almalinux:9
+    steps:
+      - name: C compiler and Rust
+        run: |
+          dnf install -y gcc git tar gzip
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tasker-linux
+          path: target/release/tasker

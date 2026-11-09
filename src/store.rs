@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{Duration, NaiveDate};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::model::*;
 use crate::settings::Settings;
@@ -86,15 +86,12 @@ type Res<T> = rusqlite::Result<T>;
 
 /// Bring databases from older versions up to the current schema.
 fn migrate(conn: &Connection) -> Res<()> {
-    let has_added: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name='added_secs'")?
-        .exists([])?;
+    let has_added: bool = conn.prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name='added_secs'")?.exists([])?;
     if !has_added {
         conn.execute_batch("ALTER TABLE runs ADD COLUMN added_secs INTEGER NOT NULL DEFAULT 0;")?;
     }
-    let has_ahead: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='notify_ahead'")?
-        .exists([])?;
+    let has_ahead: bool =
+        conn.prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='notify_ahead'")?.exists([])?;
     if !has_ahead {
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN notify_ahead INTEGER NOT NULL DEFAULT 0;")?;
     }
@@ -119,14 +116,22 @@ impl Store {
         )?;
         self.tasks = st
             .query_map([], |r| {
+                let id: i64 = r.get(0)?;
+                let title: String = r.get(1)?;
                 let sched: String = r.get(3)?;
+                // A schedule that can't be read must not keep the app from starting: the
+                // task shows up today (so it gets noticed) and the log says what happened.
+                let schedule = serde_json::from_str::<Schedule>(&sched).unwrap_or_else(|e| {
+                    crate::logfile::error(format!(
+                        "task {id} \"{title}\": unreadable schedule {sched:?} ({e}); shown as a one-off task today"
+                    ));
+                    Schedule::Date { date: chrono::Local::now().date_naive(), repeat: Repeat::Never }
+                });
                 Ok(Task {
-                    id: r.get(0)?,
-                    title: r.get(1)?,
+                    id,
+                    title,
                     notes: r.get(2)?,
-                    schedule: serde_json::from_str::<Schedule>(&sched)
-                        .unwrap_or(Schedule::Date { date: chrono::Local::now().date_naive(), repeat: Repeat::Never })
-                        .normalized(),
+                    schedule: schedule.normalized(),
                     start_min: r.get(4)?,
                     estimate_min: r.get(5)?,
                     priority: Priority::from_i64(r.get(6)?),
@@ -141,9 +146,9 @@ impl Store {
 
         let mut segs: HashMap<i64, Vec<Segment>> = HashMap::new();
         let mut st = self.conn.prepare("SELECT id,run_id,start,end FROM segments ORDER BY start")?;
-        for row in st.query_map([], |r| {
-            Ok((r.get::<_, i64>(1)?, Segment { id: r.get(0)?, start: r.get(2)?, end: r.get(3)? }))
-        })? {
+        for row in st
+            .query_map([], |r| Ok((r.get::<_, i64>(1)?, Segment { id: r.get(0)?, start: r.get(2)?, end: r.get(3)? })))?
+        {
             let (run_id, seg) = row?;
             segs.entry(run_id).or_default().push(seg);
         }
@@ -156,10 +161,15 @@ impl Store {
             .query_map([], |r| {
                 let date: String = r.get(2)?;
                 let id: i64 = r.get(0)?;
+                // Same for a run's date: keep the run (its tracked time), filed under 1970-01-01.
+                let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap_or_else(|e| {
+                    crate::logfile::error(format!("run {id}: unreadable date {date:?} ({e}); filed under 1970-01-01"));
+                    NaiveDate::default()
+                });
                 Ok(Run {
                     id,
                     task_id: r.get(1)?,
-                    date: NaiveDate::parse_from_str(&date, "%Y-%m-%d").unwrap_or_default(),
+                    date,
                     title: r.get(3)?,
                     notes: r.get(4)?,
                     start_min: r.get(5)?,
@@ -372,7 +382,10 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("INSERT INTO segments(run_id,start) VALUES(?1,?2)", params![run_id, now])?;
         let seg = Segment { id: tx.last_insert_rowid(), start: now, end: None };
-        tx.execute("UPDATE runs SET status=?1, finished_at=NULL WHERE id=?2", params![RunStatus::Running as i64, run_id])?;
+        tx.execute(
+            "UPDATE runs SET status=?1, finished_at=NULL WHERE id=?2",
+            params![RunStatus::Running as i64, run_id],
+        )?;
         tx.commit()?;
         let r = &mut self.runs[idx];
         r.segments.push(seg);
@@ -408,7 +421,10 @@ impl Store {
         if let Some(i) = open {
             tx.execute("UPDATE segments SET end=?1 WHERE id=?2", params![now, self.runs[idx].segments[i].id])?;
         }
-        tx.execute("UPDATE runs SET status=?1, finished_at=?2 WHERE id=?3", params![status as i64, finished_at, run_id])?;
+        tx.execute(
+            "UPDATE runs SET status=?1, finished_at=?2 WHERE id=?3",
+            params![status as i64, finished_at, run_id],
+        )?;
         tx.commit()?;
         let r = &mut self.runs[idx];
         if let Some(i) = open {
@@ -453,9 +469,9 @@ impl Store {
             let parts: Vec<&str> = key.split(':').collect();
             match parts.as_slice() {
                 ["due" | "ahead", _, date] => NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok_and(|d| d < cutoff),
-                ["over", id] => id.parse::<i64>().is_ok_and(|id| {
-                    self.run(id).is_none_or(|r| r.status == RunStatus::Done && r.date < cutoff)
-                }),
+                ["over", id] => id
+                    .parse::<i64>()
+                    .is_ok_and(|id| self.run(id).is_none_or(|r| r.status == RunStatus::Done && r.date < cutoff)),
                 _ => false,
             }
         };
@@ -517,6 +533,26 @@ mod tests {
         drop(s);
         let s = Store::open(&path).unwrap();
         assert_eq!(s.run(1).unwrap().added_secs, 600, "persisted");
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn damaged_rows_still_load() {
+        let path = temp_db("damaged");
+        {
+            let mut s = Store::open(&path).unwrap();
+            let id = s
+                .save_task(test_task("Broken", Schedule::Date { date: day(11, 5), repeat: Repeat::Never }, 600, 30))
+                .unwrap();
+            s.start(id, day(11, 5), 100).unwrap();
+            s.conn.execute_batch("UPDATE tasks SET schedule='not json'; UPDATE runs SET date='05.11.2026';").unwrap();
+        }
+        // Both are reported in the log; the data stays usable.
+        let s = Store::open(&path).unwrap();
+        assert!(matches!(s.tasks[0].schedule, Schedule::Date { repeat: Repeat::Never, .. }));
+        assert_eq!(s.runs[0].date, NaiveDate::default());
+        assert_eq!(s.runs[0].tracked_secs(160), 60, "the tracked time is kept");
         drop(s);
         let _ = std::fs::remove_file(&path);
     }
@@ -596,7 +632,9 @@ mod tests {
     #[test]
     fn finished_runs_stay_finished() {
         let mut s = Store::open(Path::new(":memory:")).unwrap();
-        let id = s.save_task(test_task("Report", Schedule::Date { date: day(11, 5), repeat: Repeat::Never }, 600, 30)).unwrap();
+        let id = s
+            .save_task(test_task("Report", Schedule::Date { date: day(11, 5), repeat: Repeat::Never }, 600, 30))
+            .unwrap();
         let run = s.start(id, day(11, 5), 100).unwrap();
         s.finish(run, 200).unwrap();
         // stale actions (e.g. from an old panel menu or a reminder) must not change it
@@ -625,7 +663,12 @@ mod tests {
         let path = temp_db("reopen");
         let (id, run) = {
             let mut s = Store::open(&path).unwrap();
-            let mut t = test_task("Gym", Schedule::Weekdays { mask: 0b1_0000, from: day(11, 2), every: WeekRepeat::Weekly }, 18 * 60, 60);
+            let mut t = test_task(
+                "Gym",
+                Schedule::Weekdays { mask: 0b1_0000, from: day(11, 2), every: WeekRepeat::Weekly },
+                18 * 60,
+                60,
+            );
             t.notify_ahead_min = 15;
             t.priority = Priority::High;
             let id = s.save_task(t).unwrap();
@@ -652,18 +695,27 @@ mod tests {
     #[test]
     fn day_lists_mix_runs_and_planned_tasks() {
         let mut s = Store::open(Path::new(":memory:")).unwrap();
-        let daily = s.save_task(test_task("Mail", Schedule::Weekdays { mask: 0b111_1111, from: day(11, 1), every: WeekRepeat::Weekly }, 8 * 60, 30)).unwrap();
-        let once = s.save_task(test_task("Dentist", Schedule::Date { date: day(11, 6), repeat: Repeat::Never }, 10 * 60, 60)).unwrap();
+        let daily = s
+            .save_task(test_task(
+                "Mail",
+                Schedule::Weekdays { mask: 0b111_1111, from: day(11, 1), every: WeekRepeat::Weekly },
+                8 * 60,
+                30,
+            ))
+            .unwrap();
+        let once = s
+            .save_task(test_task("Dentist", Schedule::Date { date: day(11, 6), repeat: Repeat::Never }, 10 * 60, 60))
+            .unwrap();
         s.start(daily, day(11, 6), 100).unwrap();
         for d in 1..=10 {
             let date = day(11, d);
             assert_eq!(s.count_for(date), s.entries_for(date, 0).len(), "count_for matches on day {d}");
         }
         let e = s.entries_for(day(11, 6), 200);
-        assert_eq!(e.iter().map(|e| (e.title.as_str(), e.status)).collect::<Vec<_>>(), [
-            ("Mail", EntryStatus::Running),
-            ("Dentist", EntryStatus::Virtual)
-        ]);
+        assert_eq!(
+            e.iter().map(|e| (e.title.as_str(), e.status)).collect::<Vec<_>>(),
+            [("Mail", EntryStatus::Running), ("Dentist", EntryStatus::Virtual)]
+        );
         assert_eq!(s.entries_for(day(11, 7), 0).len(), 1, "the one-off is only on its day");
         assert_eq!(s.count_for(day(10, 31)), 0, "nothing before the schedule starts");
 
@@ -682,10 +734,14 @@ mod tests {
         let path = temp_db("prune");
         {
             let mut s = Store::open(&path).unwrap();
-            let id = s.save_task(test_task("T", Schedule::Date { date: day(10, 1), repeat: Repeat::Never }, 600, 10)).unwrap();
+            let id = s
+                .save_task(test_task("T", Schedule::Date { date: day(10, 1), repeat: Repeat::Never }, 600, 10))
+                .unwrap();
             let old_run = s.start(id, day(10, 1), 100).unwrap();
             s.finish(old_run, 200).unwrap();
-            let id2 = s.save_task(test_task("U", Schedule::Date { date: day(10, 2), repeat: Repeat::Never }, 600, 10)).unwrap();
+            let id2 = s
+                .save_task(test_task("U", Schedule::Date { date: day(10, 2), repeat: Repeat::Never }, 600, 10))
+                .unwrap();
             let open_run = s.start(id2, day(10, 2), 100).unwrap();
             let st = NotifState { dismissed: true, snooze_until: None };
             for key in [
@@ -720,7 +776,9 @@ mod tests {
         let mut s = Store::open(Path::new(":memory:")).unwrap();
         let from = NaiveDate::from_ymd_opt(2023, 11, 6).unwrap();
         let every_day = Schedule::Weekdays { mask: 0b111_1111, from, every: WeekRepeat::Weekly };
-        let ids: Vec<i64> = (0..20).map(|i| s.save_task(test_task(&format!("Task {i}"), every_day.clone(), 8 * 60 + i * 20, 15)).unwrap()).collect();
+        let ids: Vec<i64> = (0..20)
+            .map(|i| s.save_task(test_task(&format!("Task {i}"), every_day.clone(), 8 * 60 + i * 20, 15)).unwrap())
+            .collect();
         let today = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
         let mut d = from;
         while d < today {

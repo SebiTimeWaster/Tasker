@@ -1,3 +1,0 @@
-[alias]
-# Release builds for Linux and Windows, copied to binary/ (see xtask/src/main.rs).
-build-all = "run --quiet --package xtask --"

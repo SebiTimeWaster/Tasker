@@ -7,13 +7,15 @@ use chrono::{Datelike, Duration, NaiveDate};
 use egui::epaint::Mesh;
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
-    Align, Align2, Color32, FontId, Frame, Galley, Id, Layout, Margin, Pos2, Rect, RichText, ScrollArea, Sense,
-    Stroke, Ui, UiBuilder,
+    Align, Align2, Color32, FontId, Frame, Galley, Id, Layout, Margin, Pos2, Rect, RichText, ScrollArea, Sense, Stroke,
+    Ui, UiBuilder,
 };
 
-use crate::app::{now_min, now_ts, snoozed_until, start_offset_labels, task_buttons, today, Action, TaskerApp, GRID_LINE};
+use crate::action::Action;
+use crate::app::{GRID_LINE, TaskerApp, now_min, now_ts, snoozed_until, today};
 use crate::dialogs::Editor;
 use crate::model::*;
+use crate::widgets::{start_offset_labels, task_buttons};
 
 const ACCENT: Color32 = Color32::from_rgb(90, 140, 210);
 
@@ -130,7 +132,13 @@ pub fn month_grid(
             let n = counts(d);
             if n > 0 {
                 let dots = n.min(4);
-                let dot_col = if d == *selected { Color32::WHITE } else if in_month { ACCENT } else { Color32::from_gray(90) };
+                let dot_col = if d == *selected {
+                    Color32::WHITE
+                } else if in_month {
+                    ACCENT
+                } else {
+                    Color32::from_gray(90)
+                };
                 let total_w = dots as f32 * 6.0 - 2.0;
                 for k in 0..dots {
                     let x = r.center().x - total_w / 2.0 + k as f32 * 6.0 + 2.0;
@@ -168,7 +176,10 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
     p.hline(rect.x_range(), rect.top(), Stroke::new(1.0, GRID_LINE));
     for i in 0..7 {
         let d = monday + Duration::days(i);
-        let r = Rect::from_min_size(egui::pos2(rect.left(), rect.top() + row_h * i as f32), egui::vec2(rect.width(), row_h));
+        let r = Rect::from_min_size(
+            egui::pos2(rect.left(), rect.top() + row_h * i as f32),
+            egui::vec2(rect.width(), row_h),
+        );
         let resp = ui.interact(r, Id::unique(("week-row", i)), Sense::click());
         if d == app.selected {
             p.rect_filled(r.shrink2(egui::vec2(0.0, 1.0)), 0.0, Color32::from_rgb(44, 58, 82));
@@ -179,7 +190,13 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
         let name_col = if d == today { Color32::from_rgb(240, 200, 90) } else { Color32::from_gray(230) };
         let big = (row_h * 0.3).clamp(13.0, 18.0);
         let x = r.left() + 8.0;
-        p.text(egui::pos2(x, r.top() + 6.0), Align2::LEFT_TOP, WEEKDAY_LONG[i as usize], FontId::proportional(big), name_col);
+        p.text(
+            egui::pos2(x, r.top() + 6.0),
+            Align2::LEFT_TOP,
+            WEEKDAY_LONG[i as usize],
+            FontId::proportional(big),
+            name_col,
+        );
         p.text(
             egui::pos2(x + 100.0, r.top() + 6.0 + big * 0.15),
             Align2::LEFT_TOP,
@@ -194,7 +211,13 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
             Align2::RIGHT_CENTER,
             total.to_string(),
             FontId::proportional((row_h * 0.45).clamp(16.0, 28.0)),
-            if total == 0 { Color32::from_gray(90) } else if done == total { Color32::from_rgb(110, 170, 120) } else { Color32::WHITE },
+            if total == 0 {
+                Color32::from_gray(90)
+            } else if done == total {
+                Color32::from_rgb(110, 170, 120)
+            } else {
+                Color32::WHITE
+            },
         );
         if let Some(e) = next_task(&entries, d) {
             let txt = format!("{}  {}", fmt_hm(e.start_min), e.title);
@@ -206,7 +229,13 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
             }
         } else if total > 0 {
             let y = r.top() + 8.0 + big + 4.0;
-            p.text(egui::pos2(x, y), Align2::LEFT_TOP, "all done ✔", FontId::proportional(12.0), Color32::from_rgb(110, 170, 120));
+            p.text(
+                egui::pos2(x, y),
+                Align2::LEFT_TOP,
+                "all done ✔",
+                FontId::proportional(12.0),
+                Color32::from_rgb(110, 170, 120),
+            );
         }
         p.hline(rect.x_range(), r.bottom(), Stroke::new(1.0, GRID_LINE));
         if resp.clicked() {
@@ -225,7 +254,8 @@ const HEADER_H: f32 = 44.0;
 pub fn day_view(app: &mut TaskerApp, ui: &mut Ui) {
     let rect = ui.max_rect();
     let tl = Rect::from_min_max(rect.min, egui::pos2(rect.left() + TIMELINE_W, rect.bottom()));
-    let gap = Rect::from_min_max(egui::pos2(tl.right(), rect.top()), egui::pos2(tl.right() + CONNECTOR_W, rect.bottom()));
+    let gap =
+        Rect::from_min_max(egui::pos2(tl.right(), rect.top()), egui::pos2(tl.right() + CONNECTOR_W, rect.bottom()));
     let list = Rect::from_min_max(egui::pos2(gap.right(), rect.top()), rect.max);
     let header = Rect::from_min_max(list.min, egui::pos2(list.right(), list.top() + HEADER_H));
     let body = Rect::from_min_max(egui::pos2(list.left(), header.bottom()), list.max);
@@ -247,17 +277,20 @@ pub fn day_view(app: &mut TaskerApp, ui: &mut Ui) {
     let est: u32 = entries.iter().map(|e| e.estimate_min).sum();
     let tracked: i64 = entries.iter().map(|e| e.tracked_secs).sum();
     let short = format!("{} tasks · {} done", entries.len(), done);
-    let long = format!(
-        "{short} · planned {} · tracked {}",
-        fmt_duration_min(est),
-        fmt_duration_min((tracked / 60) as u32)
-    );
+    let long =
+        format!("{short} · planned {} · tracked {}", fmt_duration_min(est), fmt_duration_min((tracked / 60) as u32));
     // drop the details when the window is too narrow for them
     let room = header.right() - 14.0 - (title.right() + 20.0);
     let layout = |t: String| ui.fonts_mut(|f| f.layout_no_wrap(t, FontId::proportional(13.0), Color32::from_gray(160)));
-    let summary = Some(layout(long)).filter(|g| g.size().x <= room).or_else(|| Some(layout(short)).filter(|g| g.size().x <= room));
+    let summary = Some(layout(long))
+        .filter(|g| g.size().x <= room)
+        .or_else(|| Some(layout(short)).filter(|g| g.size().x <= room));
     if let Some(g) = summary {
-        p.galley(egui::pos2(header.right() - 14.0 - g.size().x, header.center().y - g.size().y / 2.0), g, Color32::from_gray(160));
+        p.galley(
+            egui::pos2(header.right() - 14.0 - g.size().x, header.center().y - g.size().y / 2.0),
+            g,
+            Color32::from_gray(160),
+        );
     }
     p.hline(list.x_range(), header.bottom(), Stroke::new(1.0, GRID_LINE));
 
@@ -307,7 +340,13 @@ fn timeline(ui: &Ui, tl: Rect, entries: &[Entry], is_today: bool) {
     let p = ui.painter_at(tl.expand2(egui::vec2(0.0, 1.0)));
     p.rect_filled(tl, 0.0, Color32::from_gray(26));
     let hour_h = tl.height() / 24.0;
-    let label_every = if hour_h >= 16.0 { 1 } else if hour_h >= 9.0 { 2 } else { 3 };
+    let label_every = if hour_h >= 16.0 {
+        1
+    } else if hour_h >= 9.0 {
+        2
+    } else {
+        3
+    };
     for h in 0..=24u32 {
         let y = minute_y(tl, h * 60);
         let major = h % 6 == 0;
@@ -333,7 +372,8 @@ fn timeline(ui: &Ui, tl: Rect, entries: &[Entry], is_today: bool) {
         lane_end[lane] = e.end_min().max(e.start_min + 1);
         let x = tl.right() - 6.0 - lane as f32 * 6.0;
         let (y0, y1) = (minute_y(tl, e.start_min), minute_y(tl, e.end_min()).max(minute_y(tl, e.start_min) + 2.0));
-        let col = if e.status == EntryStatus::Done { e.priority.color().gamma_multiply(0.35) } else { e.priority.color() };
+        let col =
+            if e.status == EntryStatus::Done { e.priority.color().gamma_multiply(0.35) } else { e.priority.color() };
         p.rect_filled(Rect::from_x_y_ranges(x - 2.0..=x + 2.0, y0..=y1), 2.0, col);
     }
     if is_today {
@@ -479,7 +519,12 @@ fn task_row(ui: &mut Ui, e: &Entry, now: i64, snoozed: Option<i64>) -> (Rect, Op
                 Color32::from_rgb(220, 90, 80)
             };
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("⏱ {}", fmt_hms(e.tracked_secs))).monospace().size(15.0).color(Color32::WHITE));
+                ui.label(
+                    RichText::new(format!("⏱ {}", fmt_hms(e.tracked_secs)))
+                        .monospace()
+                        .size(15.0)
+                        .color(Color32::WHITE),
+                );
                 ui.label(RichText::new(format!("/ {}", fmt_hms(est))).monospace().color(Color32::from_gray(150)));
                 let (bar, _) = ui.allocate_exact_size(egui::vec2(160.0, 8.0), Sense::hover());
                 let p = ui.painter();
@@ -511,7 +556,9 @@ fn task_row(ui: &mut Ui, e: &Entry, now: i64, snoozed: Option<i64>) -> (Rect, Op
                     }
                     if e.added_secs > 0 {
                         ui.add_space(8.0);
-                        ui.label(RichText::new(format!("{} added", fmt_span_min(e.added_secs / 60))).size(12.0).color(gray));
+                        ui.label(
+                            RichText::new(format!("{} added", fmt_span_min(e.added_secs / 60))).size(12.0).color(gray),
+                        );
                         if ui.small_button("Reset").on_hover_text("Remove the added time again").clicked() {
                             action = Some(Action::ResetAddedTime(id));
                         }
@@ -527,15 +574,19 @@ fn task_row(ui: &mut Ui, e: &Entry, now: i64, snoozed: Option<i64>) -> (Rect, Op
             if !done {
                 start_offset_labels(ui, e, now, snoozed, false);
             }
-            if let (true, Some(fin)) = (done, e.finished_at) {
-                if let Some(dt) = chrono::DateTime::from_timestamp(fin, 0) {
-                    let local = dt.with_timezone(&chrono::Local);
-                    ui.label(RichText::new(format!("finished {}", local.format("%H:%M"))).color(Color32::from_gray(170)));
-                }
+            if let (true, Some(fin)) = (done, e.finished_at)
+                && let Some(dt) = chrono::DateTime::from_timestamp(fin, 0)
+            {
+                let local = dt.with_timezone(&chrono::Local);
+                ui.label(RichText::new(format!("finished {}", local.format("%H:%M"))).color(Color32::from_gray(170)));
             }
         });
     });
     let r = resp.response.rect;
-    ui.painter().rect_filled(Rect::from_min_size(r.min, egui::vec2(4.0, r.height())), 0.0, e.priority.color().gamma_multiply(if done { 0.4 } else { 1.0 }));
+    ui.painter().rect_filled(
+        Rect::from_min_size(r.min, egui::vec2(4.0, r.height())),
+        0.0,
+        e.priority.color().gamma_multiply(if done { 0.4 } else { 1.0 }),
+    );
     (r, action)
 }

@@ -17,38 +17,31 @@ A desktop task planner and time tracker for Linux and Windows, written in Rust w
 ## Build & run
 
 ```sh
-cargo build-all             # release builds for Linux and Windows -> binary/tasker, binary/tasker.exe
-binary/tasker               # run it
-binary/tasker --minimized   # start in the panel (e.g. for autostart)
-binary/tasker --test-sound  # play the configured reminder sound, report errors
+cargo run                            # debug build, and start it
+cargo build --release                # optimized build: target/release/tasker
+target/release/tasker --minimized    # start in the panel (e.g. for autostart)
+target/release/tasker --test-sound   # play the configured reminder sound, report errors
 ```
 
-`cargo build-all` builds the OS it runs on natively and cross-compiles the other one. It
-works on Linux and Windows and needs a cross toolchain once (missing Rust targets are added
-automatically):
+Tasker is a plain cargo project: `cargo build`, `cargo run` and `cargo test` work on Linux
+and on Windows (there Rust needs the MSVC build tools; rustup's installer offers them).
+Release builds are optimized as one piece (LTO), which makes the binary about a third
+smaller but takes a few minutes, also after a small change.
 
-| Building on | One-time setup for the other OS's binary |
-|-------------|------------------------------------------|
-| Linux       | MinGW: `sudo apt install gcc-mingw-w64-x86-64` (Fedora: `mingw64-gcc`) |
-| Windows     | zig: `winget install zig.zig`, then `cargo install --locked cargo-zigbuild` |
+**Binaries for other machines** are built by GitHub Actions on every push
+(`.github/workflows/ci.yml`). Download them from the run's page under *Artifacts*; the
+Linux one needs a `chmod +x` after unpacking.
 
-On Windows, Rust itself needs the MSVC build tools (rustup's installer offers them). If the
-cross toolchain is missing, the native binary is still built and copied, and the command
-fails with the install hint. `binary/` is ignored by git.
-
-Plain `cargo build`, `cargo run` and `cargo test` work as usual and only build for the
-current OS (`target/debug` or `target/release`). `build-all` is a cargo alias
-(`.cargo/config.toml`) for the small build program in `xtask/`: cargo has no post-build
-step, and an alias can't take over `cargo build` itself.
+* `tasker` is built on AlmaLinux 9 and therefore runs on glibc 2.34 or newer (Linux Mint
+  21+, Ubuntu 22.04+, Debian 12+). A binary built on your own machine can need a glibc as new
+  as that machine's, so it may not start on an older distro.
+* `tasker.exe` is cross-compiled on Linux with MinGW. To do that yourself:
+  `sudo apt install gcc-mingw-w64-x86-64`, `rustup target add x86_64-pc-windows-gnu`, then
+  `cargo build --release --target x86_64-pc-windows-gnu`.
 
 **Linux:** no system `-dev` packages are needed. At runtime Tasker uses X11 (XWayland on Wayland
 sessions), D-Bus for the panel icon and `libasound.so.2` for sound. All of these are
 present on a normal desktop install.
-
-**Portability:** the binary runs on glibc 2.34 or newer (Linux Mint 21+, Ubuntu 22.04+,
-Debian 12+), even when built on a newer distro. `build.rs` + `build/glibc_compat.c` pin a few
-libm functions to their old symbol versions. When built on Windows, zig links against
-glibc 2.34 directly.
 
 Data lives in `~/.local/share/tasker/tasker.db` (SQLite; Windows: see below). To back it up, copy that file while
 Tasker isn't running (while it runs, recent changes may still be in `tasker.db-wal`). Reminder
@@ -71,12 +64,13 @@ while the main window is hidden panicked), wired in through `[patch.crates-io]` 
 
 ### Windows
 
-`binary/tasker.exe` is a single file that needs nothing besides Windows 10/11 itself: copy it
-anywhere and start it. It has no console window; `tasker.exe --test-sound` from a terminal
+`tasker.exe` (the MinGW build, see above) is a single file that needs nothing besides
+Windows 10/11 itself: copy it anywhere and start it. It has no console window; `tasker.exe --test-sound` from a terminal
 still prints its result. Windows may warn about an unknown publisher on the first start (the
-exe isn't signed). `build.rs` embeds the icon and version info; it finds `rc.exe` in the
-Windows SDK (or `RC`), MinGW's `windres` (or `WINDRES`) when cross-compiling. Without one the
-build prints a warning and the exe has a generic file icon; the app itself is unaffected. For autostart, put a shortcut with `--minimized` into the folder that
+exe isn't signed). `build.rs` puts the icon (`assets/tasker.ico`) and the version info into the
+exe with the `winresource` crate, which uses MinGW's `windres` (on Windows: `rc.exe` from the
+Windows SDK). Without one the build prints a warning and the exe has a generic file icon; the
+app itself is unaffected. For autostart, put a shortcut with `--minimized` into the folder that
 `Win+R` → `shell:startup` opens.
 
 What differs from Linux: the panel icon is a normal notification-area icon (left click
@@ -165,7 +159,10 @@ Tasker can start minimized there (`--minimized` does the same once).
 | `src/main.rs`     | Startup: single instance, window options, `--minimized` / `--test-sound` |
 | `src/model.rs`    | Tasks, schedules, runs, per-day entries, formatting |
 | `src/store.rs`    | SQLite persistence, migrations, in-memory model, time tracking |
-| `src/app.rs`      | App state, window chrome and geometry, which reminders to show, reminder windows |
+| `src/app/mod.rs`  | App state, what a click on a task does, the frame loop |
+| `src/app/window.rs` | Title bar and resize edges, show / hide, UI scale, window geometry |
+| `src/app/reminders.rs` | Which reminders to show, the reminder windows |
+| `src/action.rs`, `src/widgets.rs` | Task actions (start, pause, …) and the buttons / labels shared by the day view and the reminders |
 | `src/views.rs`    | Calendar, week list, 24h timeline, day's task rows, connector lines |
 | `src/dialogs.rs`  | Task editor, task list, statistics, settings |
 | `src/settings.rs` | Settings and their defaults, UI scale steps, saved window geometry |
@@ -173,19 +170,24 @@ Tasker can start minimized there (`--minimized` does the same once).
 | `src/logfile.rs`  | Log file, panic hook, crash (signal) handler on Linux |
 | `src/tray.rs`, `src/icon.rs` | Panel icon contents (color, tooltip, menu), generated icon |
 | `src/platform/`   | Everything OS-specific, as `linux/` and `windows/` with the same names: screen work areas (X11 / Win32), panel icon (D-Bus / notification area), single instance (Unix socket / localhost port), sound output (ALSA / waveOut), file chooser (zenity, kdialog / Windows dialog) |
-| `build.rs`        | Linux: glibc symbol pinning. Windows: icon and version info in the .exe |
-| `xtask/`          | `cargo build-all`: native + cross build, copies the binaries to `binary/` |
+| `build.rs`, `assets/tasker.ico` | Windows: icon and version info in the .exe |
+| `.github/workflows/ci.yml` | CI: formatting, lints, tests and the release binaries on every push |
 
 ## Tests
 
 ```sh
 cargo test                  # schedules, store, reminders, editor, statistics, settings, tray
 cargo test --release frame_queries -- --ignored --nocapture   # per-frame cost with 3 years of history
+cargo clippy --all-targets -- -D warnings                      # lints
+cargo fmt                                                      # formatting (rustfmt.toml)
 ```
 
-Most modules have tests at the bottom. The reminder logic (`wanted_reminders` in `app.rs`)
-is a plain function of the store and the time, so new reminder rules can be tested without
-a display.
+Most modules have tests at the bottom. The reminder logic (`wanted_reminders` in
+`app/reminders.rs`) is a plain function of the store and the time, so new reminder rules can
+be tested without a display.
 
-In VS Code, Ctrl+Shift+B runs `cargo build-all`; "Tasks: Run Task" also offers a debug build
+Don't use `cargo fmt --all`: it would also reformat the vendored eframe. GitHub Actions
+runs the checks above on every push (`.github/workflows/ci.yml`).
+
+In VS Code, Ctrl+Shift+B runs `cargo build --release`; "Tasks: Run Task" also offers a debug build
 (`.vscode/tasks.json`).

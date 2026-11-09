@@ -4,9 +4,7 @@
 
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
-use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageEvent, ConnectionExt as _, EventMask, Window,
-};
+use x11rb::protocol::xproto::{AtomEnum, ClientMessageEvent, ConnectionExt as _, EventMask, Window};
 use x11rb::rust_connection::RustConnection;
 
 pub struct X11 {
@@ -44,7 +42,8 @@ impl X11 {
             "_NET_WM_STATE_SKIP_PAGER",
             "_NET_WM_STATE_ABOVE",
         ];
-        let cookies: Vec<_> = names.iter().map(|n| conn.intern_atom(false, n.as_bytes())).collect::<Result<_, _>>().ok()?;
+        let cookies: Vec<_> =
+            names.iter().map(|n| conn.intern_atom(false, n.as_bytes())).collect::<Result<_, _>>().ok()?;
         let a: Vec<u32> = cookies.into_iter().map(|c| c.reply().map(|r| r.atom)).collect::<Result<_, _>>().ok()?;
         let atoms = Atoms {
             net_wm_name: a[0],
@@ -94,7 +93,12 @@ impl X11 {
     }
 
     fn window_title(&self, win: Window) -> Option<String> {
-        let r = self.conn.get_property(false, win, self.atoms.net_wm_name, self.atoms.utf8_string, 0, 1024).ok()?.reply().ok()?;
+        let r = self
+            .conn
+            .get_property(false, win, self.atoms.net_wm_name, self.atoms.utf8_string, 0, 1024)
+            .ok()?
+            .reply()
+            .ok()?;
         String::from_utf8(r.value).ok()
     }
 

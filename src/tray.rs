@@ -2,7 +2,7 @@
 //! is up to the platform (`platform::Tray`: D-Bus StatusNotifierItem on Linux, the
 //! notification area on Windows); both use the model built here.
 
-use crate::app::Action;
+use crate::action::Action;
 use crate::icon::IconState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +43,11 @@ pub enum MenuEntry {
     /// A greyed-out line (a task's title).
     Heading(String),
     /// A clickable entry. `icon` is a freedesktop icon name (ignored where unsupported).
-    Item { label: String, icon: &'static str, msg: UiMsg },
+    Item {
+        label: String,
+        icon: &'static str,
+        msg: UiMsg,
+    },
     Separator,
 }
 
@@ -63,7 +67,11 @@ pub fn menu(running: &[RunningTask]) -> Vec<MenuEntry> {
         };
         items.push(MenuEntry::Heading(format!("{mark} {}", short_title(&t.title))));
         items.push(MenuEntry::Item { label: format!("      {label}"), icon, msg: UiMsg::Task(action) });
-        items.push(MenuEntry::Item { label: "      Finish".into(), icon: "emblem-default", msg: UiMsg::Task(Action::Finish(id)) });
+        items.push(MenuEntry::Item {
+            label: "      Finish".into(),
+            icon: "emblem-default",
+            msg: UiMsg::Task(Action::Finish(id)),
+        });
         items.push(MenuEntry::Separator);
     }
     items.push(MenuEntry::Item { label: "Show / hide".into(), icon: "", msg: UiMsg::ToggleWindow });
@@ -139,16 +147,19 @@ mod tests {
                 MenuEntry::Separator => None,
             })
             .collect();
-        assert_eq!(labels, [
-            "▶ Busy work",
-            "      Pause",
-            "      Finish",
-            "⏸ Paused one",
-            "      Resume",
-            "      Finish",
-            "Show / hide",
-            "Quit"
-        ]);
+        assert_eq!(
+            labels,
+            [
+                "▶ Busy work",
+                "      Pause",
+                "      Finish",
+                "⏸ Paused one",
+                "      Resume",
+                "      Finish",
+                "Show / hide",
+                "Quit"
+            ]
+        );
         assert_eq!(tooltip(&tasks(&[(1, "a", true), (2, "b", false)])), "⏸ a\n▶ b");
     }
 

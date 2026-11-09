@@ -1,6 +1,7 @@
 // No console window on Windows (the log file has everything; see `attach_console`).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod action;
 mod app;
 mod audio;
 mod dialogs;
@@ -12,6 +13,7 @@ mod settings;
 mod store;
 mod tray;
 mod views;
+mod widgets;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -114,21 +116,4 @@ fn main() -> eframe::Result {
         Err(e) => logfile::error(format!("exit with error: {e}")),
     }
     res
-}
-
-#[cfg(test)]
-mod tests {
-    /// The libm functions pinned in build/glibc_compat.c must still compute correctly.
-    #[test]
-    fn pinned_libm_functions() {
-        let x = std::hint::black_box(0.5f32);
-        assert!((x.acos() - 1.0471976).abs() < 1e-6);
-        assert!((x.asin() - 0.5235988).abs() < 1e-6);
-        assert!((x.atan2(1.0) - 0.4636476).abs() < 1e-6);
-        assert!(((x + 1.0).acosh() - 0.9624237).abs() < 1e-6);
-        assert!((x.cosh() - 1.127626).abs() < 1e-6);
-        assert!((x.sinh() - 0.5210953).abs() < 1e-6);
-        assert!((x.hypot(1.2) - 1.3).abs() < 1e-6);
-        assert!((std::hint::black_box(3.0f64).hypot(4.0) - 5.0).abs() < 1e-12);
-    }
 }

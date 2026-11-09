@@ -1,9 +1,9 @@
 //! Panel icon via the StatusNotifierItem D-Bus protocol (KDE, Cinnamon/Mint via
 //! xapp-sn-watcher, XFCE, GNOME with the AppIndicator extension, …).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 
 use crate::tray::{self as model, MenuEntry, RunningTask, UiMsg};
 
@@ -36,7 +36,7 @@ impl ksni::Tray for TaskerTray {
             .map(|s| {
                 let rgba = crate::icon::render(s, state);
                 // RGBA -> ARGB (network byte order)
-                let data = rgba.chunks_exact(4).flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
+                let data = rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
                 ksni::Icon { width: s as i32, height: s as i32, data }
             })
             .collect()

@@ -18,9 +18,8 @@ pub fn attach_console() {}
 
 /// The desktop's file chooser, through zenity (GNOME, Cinnamon, …) or kdialog (KDE).
 fn file_dialog_cmd() -> Option<Vec<&'static str>> {
-    let has = |b: &str| {
-        std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(b).is_file()))
-    };
+    let has =
+        |b: &str| std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(b).is_file()));
     if has("zenity") {
         Some(vec![
             "zenity",

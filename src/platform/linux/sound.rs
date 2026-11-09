@@ -2,7 +2,7 @@
 //! PipeWire / PulseAudio. `libasound.so.2` is loaded at runtime, so building needs no
 //! ALSA headers and a missing library only disables sound instead of crashing.
 
-use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CStr};
+use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
 type SndPcm = c_void;
 pub struct Output {
@@ -24,7 +24,8 @@ const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
 impl Output {
     pub fn load() -> Result<Self, String> {
         unsafe {
-            let lib = libloading::Library::new("libasound.so.2").map_err(|e| format!("cannot load libasound.so.2: {e}"))?;
+            let lib =
+                libloading::Library::new("libasound.so.2").map_err(|e| format!("cannot load libasound.so.2: {e}"))?;
             macro_rules! sym {
                 ($name:literal) => {
                     *lib.get($name).map_err(|e| format!("libasound: {e}"))?

@@ -151,11 +151,11 @@ fn audio_thread(rx: Receiver<Cmd>, last_error: Arc<Mutex<Option<String>>>) {
                 Err(mpsc::TryRecvError::Disconnected) => return,
                 Err(mpsc::TryRecvError::Empty) => {}
             }
-            if let Some(max) = req.max_duration {
-                if started.elapsed() >= max {
-                    stop_reason_drain = true;
-                    break 'play;
-                }
+            if let Some(max) = req.max_duration
+                && started.elapsed() >= max
+            {
+                stop_reason_drain = true;
+                break 'play;
             }
             for f in 0..chunk_frames {
                 let t = if total > 0.0 { ((frame_no + f as u64) as f32 / total).min(1.0) } else { 1.0 };
