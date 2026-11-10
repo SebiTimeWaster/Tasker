@@ -52,9 +52,16 @@ pub mod instance {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
 
+    /// In the user's runtime directory. Without one the socket goes to the temporary
+    /// directory, which all users share: there its name says whose it is, so that two
+    /// users on one machine each get their own.
     fn socket_path() -> PathBuf {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        dir.join(super::super::instance_name("sock"))
+        let name = super::super::instance_name("sock");
+        match std::env::var_os("XDG_RUNTIME_DIR") {
+            Some(dir) => PathBuf::from(dir).join(name),
+            // SAFETY: getuid has no preconditions and cannot fail.
+            None => std::env::temp_dir().join(format!("u{}-{name}", unsafe { libc::getuid() })),
+        }
     }
 
     /// If an instance is running, ask it to show its window and return true.

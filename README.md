@@ -87,12 +87,26 @@ data lives in `%APPDATA%\tasker\tasker.db` and the log in `%LOCALAPPDATA%\tasker
   snapshots the plan, so editing the virtual task later changes upcoming occurrences only.
   Time is tracked in segments (start/pause/continue). **Finish** greys the task out, and
   **Resume** reopens it.
+* **Failed task**: **I am bad and won't do it** gives an occurrence up. Like Start it
+  creates the real task, but marked as failed and with no tracked time: it gets a dark red
+  background in the day view and counts as "given up" in the statistics. **Do it after
+  all** starts it anyway.
+* **Undo**: for 60 seconds after **Start task** or **I am bad and won't do it** was clicked
+  (in the day view or in a reminder), the task has an **Undo** button for clicks by
+  accident, in the day view and in the panel icon's menu. It deletes the real task again
+  (with any time tracked since), so the planned task is back, and so is its reminder.
 * **Earlier work**: while a task runs, *+1 min / +10 min / +1 hour* add time you already
   worked on it before pressing Start. It is kept apart from the measured time, so *Reset*
   removes only the added part. It also moves "started … early/late" accordingly.
 * **Day view**: each task shows how far its start is away ("starts in 25 min", "12 min
-  overdue") or how punctually it was started, and when a snoozed reminder comes back. The
-  timeline on the left marks every task's time span; overlapping tasks get separate lanes.
+  overdue") or how punctually it was first started (pausing, resuming or finishing later
+  doesn't change that), and when a snoozed reminder comes back. The timeline on the left
+  marks every task's time span; overlapping tasks get separate lanes. When a new day
+  starts, the calendar, week list and day view switch to it.
+* **Across midnight**: a task whose planned time goes past midnight (23:00 for 2 h) is on
+  both days: until midnight on its own day, from midnight on the next one ("23:00 (day
+  before) – 01:00"). It is still one task: start it on either day. The calendar dots and
+  the week list count it on both days; its tracked time counts for its own day.
 * **Schedules**
   * *A date*: once, or every year on that date (29 Feb falls back to 28 Feb).
   * *Weekdays* (any combination): every week, every 2 weeks (counted from the start
@@ -104,7 +118,8 @@ data lives in `%APPDATA%\tasker\tasker.db` and the log in `%LOCALAPPDATA%\tasker
   estimate, priority color; by start time) and all one-off tasks that haven't been started
   yet (by date; past ones are marked), each with an Edit button.
 * **Statistics** (recurring tasks, 📊): the last 30 occurrences with tracked time against the
-  estimate, how many were started / done / over the estimate, and the average start delay.
+  estimate, how many were started / done / over the estimate / given up / missed, and the
+  average start delay.
 * **Edits and history**: a started occurrence keeps the title, estimate etc. it had when
   it was started. The statistics show the current estimate as a solid line and, where it
   differs, the estimate at the time as a dashed line.
@@ -120,6 +135,10 @@ data lives in `%APPDATA%\tasker\tasker.db` and the log in `%LOCALAPPDATA%\tasker
 * A reminder pops up when a task's start time passes and it hasn't been started yet. A
   second kind appears when a running task exceeds its estimate (added earlier work counts);
   it has Pause / Finish and a Dismiss button instead of snoozing.
+* Midnight is no border: yesterday's and tomorrow's tasks are checked like today's. A task
+  that was due yesterday keeps its reminder (and a snoozed one comes back) until the end of
+  today, unless it is started or given up; a task shortly after midnight is announced
+  before midnight.
 * **Notify ahead** (per task, in minutes): a short announcement that the task starts soon.
   It has only a Dismiss button, plays no sound and closes by itself after 10 seconds.
 * Reminders are drawn by Tasker itself (not the system's notification service), in the
@@ -127,9 +146,11 @@ data lives in `%APPDATA%\tasker\tasker.db` and the log in `%LOCALAPPDATA%\tasker
   redder they get (full red after 60 min).
 * They offer the same buttons as the task (start / pause / finish / resume). Clicking one
   closes the reminder after a second. A due reminder has no close button: it stays until
-  the task is started, and only the snooze buttons (default 5 / 10 / 30 min, 1 h, 2 h) put
-  it off. Over-estimate reminders and announcements can be dismissed. Snoozing and
-  dismissing are saved, so a restart doesn't bring them back.
+  the task is started or given up, and only the snooze buttons (default 5 / 10 / 30 min,
+  1 h, 2 h) put it off. Its **I am bad and won't do it** button can only be clicked after
+  the reminder has been open for 10 seconds (it counts them down; this is not a setting).
+  Over-estimate reminders and announcements can be dismissed. Snoozing and dismissing are
+  saved, so a restart doesn't bring them back.
 * Sound loops while a reminder is open, with a volume ramp (start volume → end volume over
   N seconds). Choose a built-in sound (Chime, Bell, Beep) or a WAV/MP3/OGG/FLAC file. A
   broken file falls back to the chime.
@@ -148,7 +169,8 @@ Without a panel host, "minimize" falls back to a normal minimize so the window c
 
 **Panel icon:** a click shows or hides the window. The icon is blue when idle, yellow while
 a task is paused and green while one is running (green wins). Its right-click menu lists
-the running and paused tasks with Pause / Resume / Finish, then Show / hide and Quit. In
+the running and paused tasks with Pause / Resume / Finish (and Undo for a task started or
+given up within the last minute), then Show / hide and Quit. In
 the settings, the window's close button can minimize to the panel instead of quitting, and
 Tasker can start minimized there (`--minimized` does the same once).
 

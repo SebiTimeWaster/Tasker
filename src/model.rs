@@ -268,6 +268,8 @@ pub enum RunStatus {
     Running = 0,
     Paused = 1,
     Done = 2,
+    /// Given up ("I am bad and won't do it") without working on it.
+    Failed = 3,
 }
 
 impl RunStatus {
@@ -275,8 +277,13 @@ impl RunStatus {
         match v {
             0 => RunStatus::Running,
             2 => RunStatus::Done,
+            3 => RunStatus::Failed,
             _ => RunStatus::Paused,
         }
+    }
+    /// Still being worked on: running or paused (neither done nor given up).
+    pub fn is_open(self) -> bool {
+        matches!(self, RunStatus::Running | RunStatus::Paused)
     }
 }
 
@@ -326,7 +333,18 @@ pub enum EntryStatus {
     Running,
     Paused,
     Done,
+    Failed,
 }
+
+impl EntryStatus {
+    /// Nothing left to do: done or given up.
+    pub fn is_closed(self) -> bool {
+        matches!(self, EntryStatus::Done | EntryStatus::Failed)
+    }
+}
+
+/// Minutes of a day.
+pub const DAY_MIN: u32 = 24 * 60;
 
 /// What the UI shows for one task on one day: a virtual occurrence or a real run.
 #[derive(Clone, Debug)]
@@ -350,14 +368,30 @@ pub struct Entry {
     pub first_start: Option<i64>,
     /// Tracked time added by hand (included in `tracked_secs`).
     pub added_secs: i64,
-    pub finished_at: Option<i64>,
     /// Whether the virtual task definition still exists (for edit / stats buttons).
     pub task_exists: bool,
 }
 
 impl Entry {
-    pub fn end_min(&self) -> u32 {
-        (self.start_min + self.estimate_min).min(24 * 60)
+    /// Whether the planned time reaches into the following day (which then shows it too).
+    pub fn crosses_midnight(&self) -> bool {
+        self.start_min + self.estimate_min > DAY_MIN
+    }
+    /// The planned start in minutes after midnight of `day`: negative when the entry
+    /// belongs to the day before and is shown on `day` because it crosses midnight.
+    pub fn start_on(&self, day: NaiveDate) -> i64 {
+        (self.date - day).num_days() * DAY_MIN as i64 + self.start_min as i64
+    }
+    /// The part of the planned time that lies on `day`, as minutes after its midnight
+    /// (start, end). The rest belongs to the day before or after.
+    pub fn span_on(&self, day: NaiveDate) -> (u32, u32) {
+        let start = self.start_on(day);
+        let on_day = |min: i64| min.clamp(0, DAY_MIN as i64) as u32;
+        (on_day(start), on_day(start + self.estimate_min as i64))
+    }
+    /// The planned time as shown on `day`, e.g. "23:00 – 01:00 (next day)".
+    pub fn time_span_on(&self, day: NaiveDate) -> String {
+        fmt_time_span(self.start_min, self.estimate_min, self.date < day)
     }
     pub fn from_task(t: &Task, date: NaiveDate) -> Self {
         Entry {
@@ -377,7 +411,6 @@ impl Entry {
             tracked_secs: 0,
             first_start: None,
             added_secs: 0,
-            finished_at: None,
             task_exists: true,
         }
     }
@@ -399,11 +432,11 @@ impl Entry {
                 RunStatus::Running => EntryStatus::Running,
                 RunStatus::Paused => EntryStatus::Paused,
                 RunStatus::Done => EntryStatus::Done,
+                RunStatus::Failed => EntryStatus::Failed,
             },
             tracked_secs: r.tracked_secs(now),
             first_start: r.first_start(),
             added_secs: r.added_secs,
-            finished_at: r.finished_at,
             task_exists: task.is_some(),
         }
     }
@@ -411,6 +444,19 @@ impl Entry {
 
 pub fn fmt_hm(min: u32) -> String {
     format!("{:02}:{:02}", min / 60, min % 60)
+}
+
+/// "09:00 – 09:30". A span that crosses midnight says on which day the other end lies:
+/// "23:00 – 01:00 (next day)", or "23:00 (day before) – 01:00" where it is shown on the
+/// following day (`from_day_before`).
+pub fn fmt_time_span(start_min: u32, estimate_min: u32, from_day_before: bool) -> String {
+    let end = start_min + estimate_min;
+    let (start, end_hm) = (fmt_hm(start_min), fmt_hm(end % DAY_MIN));
+    match (end > DAY_MIN, from_day_before) {
+        (false, _) => format!("{start} – {}", if end == DAY_MIN { "24:00" } else { end_hm.as_str() }),
+        (true, false) => format!("{start} – {end_hm} (next day)"),
+        (true, true) => format!("{start} (day before) – {end_hm}"),
+    }
 }
 
 pub fn fmt_duration_min(min: u32) -> String {
@@ -592,6 +638,26 @@ mod tests {
         assert_eq!(fmt_span_min(4 * 24 * 60 + 300), "4 days", "hours dropped from 3 days on");
         assert_eq!(fmt_hms(3725), "01:02:05");
         assert_eq!(fmt_hms(-3), "00:00:00");
+    }
+
+    #[test]
+    fn spans_across_midnight() {
+        let day = d(2026, 11, 6);
+        let mut e = Entry::from_task(
+            &test_task("Night shift", Schedule::Date { date: day, repeat: Repeat::Never }, 23 * 60, 120),
+            day,
+        );
+        assert!(e.crosses_midnight());
+        assert_eq!(e.span_on(day), (23 * 60, DAY_MIN), "its own day: until midnight");
+        assert_eq!(e.span_on(d(2026, 11, 7)), (0, 60), "the next day: from midnight");
+        assert_eq!((e.start_on(day), e.start_on(d(2026, 11, 7))), (23 * 60, -60));
+        assert_eq!(e.time_span_on(day), "23:00 – 01:00 (next day)");
+        assert_eq!(e.time_span_on(d(2026, 11, 7)), "23:00 (day before) – 01:00");
+        e.estimate_min = 60;
+        assert!(!e.crosses_midnight(), "ending at midnight stays on its day");
+        assert_eq!(e.span_on(day), (23 * 60, DAY_MIN));
+        assert_eq!(e.time_span_on(day), "23:00 – 24:00");
+        assert_eq!(fmt_time_span(9 * 60, 30, false), "09:00 – 09:30");
     }
 
     #[test]

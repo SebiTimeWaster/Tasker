@@ -3,7 +3,7 @@
 //! Every change is written to the database first (multi-step changes in one transaction)
 //! and only then applied to the in-memory copy, so the two can't drift apart on errors.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use chrono::{Duration, NaiveDate};
@@ -70,13 +70,31 @@ pub struct NotifState {
 
 pub struct Store {
     conn: Connection,
-    pub tasks: Vec<Task>,
-    /// All runs ever (append-only: runs are never removed, so indices stay valid).
-    pub runs: Vec<Run>,
-    pub notif_state: HashMap<String, NotifState>,
-    /// Indices into `runs` by date. The UI asks for single days many times per frame;
-    /// this keeps that independent of how much history has piled up.
-    by_date: HashMap<NaiveDate, Vec<usize>>,
+    /// All tasks, deleted ones included (their runs still refer to them).
+    tasks: Vec<Task>,
+    /// All runs ever. Only [`Store::undo_run`] removes one (and then rebuilds the lookups,
+    /// which hold indices into this list).
+    runs: Vec<Run>,
+    notif_state: HashMap<String, NotifState>,
+    ix: Index,
+}
+
+/// Lookups into `Store::tasks` and `Store::runs` (as indices). The UI asks for single
+/// days, runs and tasks many times per frame; these keep that independent of how much
+/// history has piled up. Only [`Store::index_tasks`], [`Store::index_runs`],
+/// [`Store::index_run`] and [`Store::set_status`] write them, which is why the lists
+/// themselves are private.
+#[derive(Default)]
+struct Index {
+    task_by_id: HashMap<i64, usize>,
+    /// Planned (not deleted) tasks: the repeating ones, and the one-off ones by their date.
+    recurring: Vec<usize>,
+    once: HashMap<NaiveDate, Vec<usize>>,
+    run_by_id: HashMap<i64, usize>,
+    runs_by_date: HashMap<NaiveDate, Vec<usize>>,
+    runs_by_task: HashMap<i64, Vec<usize>>,
+    /// Runs that are running or paused, oldest first.
+    open_runs: BTreeSet<usize>,
 }
 
 /// Reminder state older than this many days is deleted at startup.
@@ -98,13 +116,21 @@ fn migrate(conn: &Connection) -> Res<()> {
     Ok(())
 }
 
+/// Order of the entries shown on `day`: by start time (one carried over from the day
+/// before comes first), then the more important one, then by title.
+fn sort_for_day(entries: &mut [Entry], day: NaiveDate) {
+    entries.sort_by(|a, b| {
+        a.start_on(day).cmp(&b.start_on(day)).then(b.priority.cmp(&a.priority)).then(a.title.cmp(&b.title))
+    });
+}
+
 impl Store {
     pub fn open(path: &Path) -> Res<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
-        let mut s = Store { conn, tasks: vec![], runs: vec![], notif_state: HashMap::new(), by_date: HashMap::new() };
+        let mut s = Store { conn, tasks: vec![], runs: vec![], notif_state: HashMap::new(), ix: Index::default() };
         s.load()?;
         s.prune_notif_state(chrono::Local::now().date_naive())?;
         Ok(s)
@@ -186,10 +212,8 @@ impl Store {
             })?
             .collect::<Res<_>>()?;
         drop(st);
-        self.by_date.clear();
-        for (i, r) in self.runs.iter().enumerate() {
-            self.by_date.entry(r.date).or_default().push(i);
-        }
+        self.index_tasks();
+        self.index_runs();
 
         let mut st = self.conn.prepare("SELECT key,dismissed,snooze_until FROM notif_state")?;
         self.notif_state = st
@@ -252,7 +276,29 @@ impl Store {
     // ---------------------------------------------------------------- tasks
 
     pub fn task(&self, id: i64) -> Option<&Task> {
-        self.tasks.iter().find(|t| t.id == id && !t.deleted)
+        self.ix.task_by_id.get(&id).map(|&i| &self.tasks[i]).filter(|t| !t.deleted)
+    }
+
+    /// All tasks that have not been deleted.
+    pub fn tasks(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.iter().filter(|t| !t.deleted)
+    }
+
+    /// Rebuild the task lookups: after loading and after every change to a task (rare,
+    /// and cheap next to the database write).
+    fn index_tasks(&mut self) {
+        let ix = &mut self.ix;
+        ix.task_by_id.clear();
+        ix.recurring.clear();
+        ix.once.clear();
+        for (i, t) in self.tasks.iter().enumerate() {
+            ix.task_by_id.insert(t.id, i);
+            match t.schedule {
+                _ if t.deleted => {}
+                Schedule::Date { date, repeat: Repeat::Never } => ix.once.entry(date).or_default().push(i),
+                _ => ix.recurring.push(i),
+            }
+        }
     }
 
     pub fn save_task(&mut self, mut t: Task) -> Res<i64> {
@@ -265,6 +311,7 @@ impl Store {
             t.id = self.conn.last_insert_rowid();
             let id = t.id;
             self.tasks.push(t);
+            self.index_tasks();
             Ok(id)
         } else {
             self.conn.execute(
@@ -272,8 +319,9 @@ impl Store {
                 params![t.title, t.notes, sched, t.start_min, t.estimate_min, t.priority as i64, t.notify as i64, t.notify_ahead_min, t.id],
             )?;
             let id = t.id;
-            if let Some(slot) = self.tasks.iter_mut().find(|x| x.id == id) {
-                *slot = t;
+            if let Some(&i) = self.ix.task_by_id.get(&id) {
+                self.tasks[i] = t;
+                self.index_tasks();
             }
             Ok(id)
         }
@@ -282,77 +330,175 @@ impl Store {
     /// Soft delete: runs (history, statistics) are kept.
     pub fn delete_task(&mut self, id: i64) -> Res<()> {
         self.conn.execute("UPDATE tasks SET deleted=1 WHERE id=?1", params![id])?;
-        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-            t.deleted = true;
+        if let Some(&i) = self.ix.task_by_id.get(&id) {
+            self.tasks[i].deleted = true;
+            self.index_tasks();
         }
         Ok(())
     }
 
     // ---------------------------------------------------------------- entries
 
-    /// Everything to show on a given day: real runs of that day plus virtual occurrences
-    /// that have not been started yet. Sorted by start time.
+    /// The entries that belong to a day: its real runs plus the virtual occurrences that
+    /// have not been started yet. Sorted by start time.
     pub fn entries_for(&self, date: NaiveDate, now: i64) -> Vec<Entry> {
         let mut out: Vec<Entry> = self.runs_on(date).map(|r| Entry::from_run(r, self.task(r.task_id), now)).collect();
         let started = out.len();
-        for t in self.virtual_tasks_on(date) {
+        for t in self.planned_on(date) {
             if !out[..started].iter().any(|e| e.task_id == t.id) {
                 out.push(Entry::from_task(t, date));
             }
         }
-        out.sort_by(|a, b| a.start_min.cmp(&b.start_min).then(b.priority.cmp(&a.priority)).then(a.title.cmp(&b.title)));
+        sort_for_day(&mut out, date);
         out
     }
 
-    /// Number of entries [`Store::entries_for`] would return, without building them.
-    pub fn count_for(&self, date: NaiveDate) -> usize {
-        let run_tasks: Vec<i64> = self.runs_on(date).map(|r| r.task_id).collect();
-        let virt = self.virtual_tasks_on(date).filter(|t| !run_tasks.contains(&t.id)).count();
-        run_tasks.len() + virt
+    /// Everything to show on a day: its own entries, and those of the day before whose
+    /// planned time reaches past midnight (they are on both days). Sorted by start time.
+    pub fn entries_shown_on(&self, date: NaiveDate, now: i64) -> Vec<Entry> {
+        let mut out = self.entries_for(date, now);
+        if let Some(before) = date.pred_opt() {
+            out.extend(self.entries_for(before, now).into_iter().filter(Entry::crosses_midnight));
+            sort_for_day(&mut out, date);
+        }
+        out
+    }
+
+    /// Number of entries [`Store::entries_shown_on`] would return, without building them.
+    pub fn count_shown_on(&self, date: NaiveDate) -> usize {
+        let from_before = |start_min: u32, estimate_min: u32| start_min + estimate_min > DAY_MIN;
+        self.count_where(date, |_, _| true) + date.pred_opt().map_or(0, |before| self.count_where(before, from_before))
+    }
+
+    /// How many entries of `date` have a (start, estimate) that `keep` accepts.
+    fn count_where(&self, date: NaiveDate, keep: impl Fn(u32, u32) -> bool) -> usize {
+        let started: Vec<i64> = self.runs_on(date).map(|r| r.task_id).collect();
+        let runs = self.runs_on(date).filter(|r| keep(r.start_min, r.estimate_min)).count();
+        let planned = self.planned_on(date).filter(|t| !started.contains(&t.id) && keep(t.start_min, t.estimate_min));
+        runs + planned.count()
+    }
+
+    /// One task's entry on one day: its run, or the virtual occurrence if it has none yet.
+    pub fn entry(&self, task_id: i64, date: NaiveDate, now: i64) -> Option<Entry> {
+        match self.run_on(task_id, date) {
+            Some(r) => Some(Entry::from_run(r, self.task(task_id), now)),
+            None => self.task(task_id).filter(|t| t.schedule.occurs_on(date)).map(|t| Entry::from_task(t, date)),
+        }
     }
 
     /// The runs (started occurrences) of one day.
     pub fn runs_on(&self, date: NaiveDate) -> impl Iterator<Item = &Run> {
-        self.by_date.get(&date).into_iter().flatten().map(|&i| &self.runs[i])
+        self.ix.runs_by_date.get(&date).into_iter().flatten().map(|&i| &self.runs[i])
+    }
+
+    /// All runs of one task.
+    pub fn runs_of(&self, task_id: i64) -> impl Iterator<Item = &Run> {
+        self.ix.runs_by_task.get(&task_id).into_iter().flatten().map(|&i| &self.runs[i])
+    }
+
+    /// The runs that are running or paused, oldest first.
+    pub fn open_runs(&self) -> impl Iterator<Item = &Run> {
+        self.ix.open_runs.iter().map(|&i| &self.runs[i])
     }
 
     /// Tasks that occur on `date` according to their schedule (started or not).
-    fn virtual_tasks_on(&self, date: NaiveDate) -> impl Iterator<Item = &Task> {
-        self.tasks.iter().filter(move |t| !t.deleted && t.schedule.occurs_on(date))
+    fn planned_on(&self, date: NaiveDate) -> impl Iterator<Item = &Task> {
+        let once = self.ix.once.get(&date).into_iter().flatten();
+        let recurring = self.ix.recurring.iter().filter(move |&&i| self.tasks[i].schedule.occurs_on(date));
+        once.chain(recurring).map(|&i| &self.tasks[i])
     }
 
     pub fn run(&self, id: i64) -> Option<&Run> {
-        self.runs.iter().find(|r| r.id == id)
+        self.run_index(id).map(|i| &self.runs[i])
+    }
+
+    /// The run of a task on a day, if that occurrence has been started (or given up).
+    fn run_on(&self, task_id: i64, date: NaiveDate) -> Option<&Run> {
+        self.runs_on(date).find(|r| r.task_id == task_id)
     }
 
     fn run_index(&self, id: i64) -> Option<usize> {
-        self.runs.iter().position(|r| r.id == id)
+        self.ix.run_by_id.get(&id).copied()
+    }
+
+    /// Rebuild the run lookups: after loading, and after a run was removed.
+    fn index_runs(&mut self) {
+        let ix = &mut self.ix;
+        ix.run_by_id.clear();
+        ix.runs_by_date.clear();
+        ix.runs_by_task.clear();
+        ix.open_runs.clear();
+        for i in 0..self.runs.len() {
+            self.index_run(i);
+        }
+    }
+
+    /// Enter the run at index `i` into the lookups (once: when it is loaded or created).
+    fn index_run(&mut self, i: usize) {
+        let r = &self.runs[i];
+        self.ix.run_by_id.insert(r.id, i);
+        self.ix.runs_by_date.entry(r.date).or_default().push(i);
+        self.ix.runs_by_task.entry(r.task_id).or_default().push(i);
+        if r.status.is_open() {
+            self.ix.open_runs.insert(i);
+        }
+    }
+
+    /// The one place a run's status changes in memory (keeps the open-runs lookup right).
+    fn set_status(&mut self, i: usize, status: RunStatus, finished_at: Option<i64>) {
+        let r = &mut self.runs[i];
+        r.status = status;
+        r.finished_at = finished_at;
+        if status.is_open() {
+            self.ix.open_runs.insert(i);
+        } else {
+            self.ix.open_runs.remove(&i);
+        }
     }
 
     // ---------------------------------------------------------------- time tracking
 
     /// Start a virtual occurrence (creates the real task) or continue a paused/finished run.
     pub fn start(&mut self, task_id: i64, date: NaiveDate, now: i64) -> Res<i64> {
-        let existing = self.runs_on(date).find(|r| r.task_id == task_id).map(|r| r.id);
-        if let Some(id) = existing {
+        if let Some(id) = self.run_on(task_id, date).map(|r| r.id) {
             self.resume(id, now)?;
             return Ok(id);
         }
+        self.create_run(task_id, date, now, RunStatus::Running)
+    }
+
+    /// Give up a virtual occurrence without working on it: creates the real task like
+    /// [`Store::start`] does, but as failed and with no tracked time. No-op if the
+    /// occurrence has been started already.
+    pub fn fail(&mut self, task_id: i64, date: NaiveDate, now: i64) -> Res<i64> {
+        match self.run_on(task_id, date).map(|r| r.id) {
+            Some(id) => Ok(id),
+            None => self.create_run(task_id, date, now, RunStatus::Failed),
+        }
+    }
+
+    /// Turn a virtual occurrence into a real task: a snapshot of the task as it is now.
+    /// As `Running` its clock starts; any other status counts as finished right away.
+    fn create_run(&mut self, task_id: i64, date: NaiveDate, now: i64, status: RunStatus) -> Res<i64> {
         let Some(t) = self.task(task_id).cloned() else {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         };
         let recurring = t.schedule.is_recurring();
+        let running = status == RunStatus::Running;
+        let finished_at = (!running).then_some(now);
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO runs(task_id,date,title,notes,start_min,estimate_min,priority,notify,recurring,status,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT INTO runs(task_id,date,title,notes,start_min,estimate_min,priority,notify,recurring,status,created_at,finished_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![t.id, date.format("%Y-%m-%d").to_string(), t.title, t.notes, t.start_min, t.estimate_min,
-                    t.priority as i64, t.notify as i64, recurring as i64, RunStatus::Running as i64, now],
+                    t.priority as i64, t.notify as i64, recurring as i64, status as i64, now, finished_at],
         )?;
         let id = tx.last_insert_rowid();
-        tx.execute("INSERT INTO segments(run_id,start) VALUES(?1,?2)", params![id, now])?;
-        let seg = Segment { id: tx.last_insert_rowid(), start: now, end: None };
+        let mut segments = Vec::new();
+        if running {
+            tx.execute("INSERT INTO segments(run_id,start) VALUES(?1,?2)", params![id, now])?;
+            segments.push(Segment { id: tx.last_insert_rowid(), start: now, end: None });
+        }
         tx.commit()?;
-        self.by_date.entry(date).or_default().push(self.runs.len());
         self.runs.push(Run {
             id,
             task_id: t.id,
@@ -364,16 +510,47 @@ impl Store {
             priority: t.priority,
             notify: t.notify,
             recurring,
-            status: RunStatus::Running,
+            status,
             created_at: now,
-            finished_at: None,
+            finished_at,
             added_secs: 0,
-            segments: vec![seg],
+            segments,
         });
+        self.index_run(self.runs.len() - 1);
         Ok(id)
     }
 
-    /// Continue a paused or finished run (a new time segment starts). No-op if running.
+    /// Take a start or give-up back (it was clicked by accident): the run is deleted
+    /// together with its tracked time, so the occurrence is a planned one again.
+    ///
+    /// Reminder state goes with it: that of the run's over-estimate reminder (a later run
+    /// may get the same id), and a due reminder that was closed by the click (clicking
+    /// Start or give-up in it marks it dismissed) is due again. A snooze is kept.
+    pub fn undo_run(&mut self, run_id: i64) -> Res<()> {
+        let Some(idx) = self.run_index(run_id) else { return Ok(()) };
+        let r = &self.runs[idx];
+        let due = format!("due:{}:{}", r.task_id, r.date);
+        let mut forget = vec![format!("over:{run_id}")];
+        if self.notif(&due).dismissed {
+            forget.push(due);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM segments WHERE run_id=?1", params![run_id])?;
+        tx.execute("DELETE FROM runs WHERE id=?1", params![run_id])?;
+        for key in &forget {
+            tx.execute("DELETE FROM notif_state WHERE key=?1", params![key])?;
+        }
+        tx.commit()?;
+        for key in &forget {
+            self.notif_state.remove(key);
+        }
+        self.runs.remove(idx);
+        self.index_runs();
+        Ok(())
+    }
+
+    /// Continue a paused, finished or given-up run (a new time segment starts). No-op if
+    /// it is running.
     pub fn resume(&mut self, run_id: i64, now: i64) -> Res<()> {
         let Some(idx) = self.run_index(run_id) else { return Ok(()) };
         if self.runs[idx].status == RunStatus::Running {
@@ -387,10 +564,8 @@ impl Store {
             params![RunStatus::Running as i64, run_id],
         )?;
         tx.commit()?;
-        let r = &mut self.runs[idx];
-        r.segments.push(seg);
-        r.status = RunStatus::Running;
-        r.finished_at = None;
+        self.runs[idx].segments.push(seg);
+        self.set_status(idx, RunStatus::Running, None);
         Ok(())
     }
 
@@ -404,10 +579,11 @@ impl Store {
         self.stop_clock(idx, now, RunStatus::Paused, None)
     }
 
-    /// Mark a run as done. No-op if it already is (keeps the original finish time).
+    /// Mark a running or paused run as done. No-op otherwise: a finished run keeps its
+    /// finish time, and a given-up one doesn't count as done.
     pub fn finish(&mut self, run_id: i64, now: i64) -> Res<()> {
         let Some(idx) = self.run_index(run_id) else { return Ok(()) };
-        if self.runs[idx].status == RunStatus::Done {
+        if !self.runs[idx].status.is_open() {
             return Ok(());
         }
         self.stop_clock(idx, now, RunStatus::Done, Some(now))
@@ -426,12 +602,10 @@ impl Store {
             params![status as i64, finished_at, run_id],
         )?;
         tx.commit()?;
-        let r = &mut self.runs[idx];
         if let Some(i) = open {
-            r.segments[i].end = Some(now);
+            self.runs[idx].segments[i].end = Some(now);
         }
-        r.status = status;
-        r.finished_at = finished_at;
+        self.set_status(idx, status, finished_at);
         Ok(())
     }
 
@@ -461,7 +635,7 @@ impl Store {
     }
 
     /// Delete reminder state nobody will ask for again: due/announcement state of days
-    /// more than a week ago, and over-estimate state of old finished (or vanished) runs.
+    /// more than a week ago, and over-estimate state of old closed (or vanished) runs.
     /// Without this the table grows by a few rows every day, forever.
     pub fn prune_notif_state(&mut self, today: NaiveDate) -> Res<usize> {
         let cutoff = today - Duration::days(NOTIF_STATE_KEEP_DAYS);
@@ -471,7 +645,7 @@ impl Store {
                 ["due" | "ahead", _, date] => NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok_and(|d| d < cutoff),
                 ["over", id] => id
                     .parse::<i64>()
-                    .is_ok_and(|id| self.run(id).is_none_or(|r| r.status == RunStatus::Done && r.date < cutoff)),
+                    .is_ok_and(|id| self.run(id).is_none_or(|r| !r.status.is_open() && r.date < cutoff)),
                 _ => false,
             }
         };
@@ -606,6 +780,9 @@ mod tests {
         s.reset_added_time(run).unwrap();
         assert_eq!(s.run(run).unwrap().tracked_secs(300), 90, "reset keeps the real time");
         assert_eq!(s.run(run).unwrap().first_start(), Some(100));
+        s.resume(run, 100 + 86_400).unwrap();
+        s.finish(run, 160 + 86_400).unwrap();
+        assert_eq!(s.run(run).unwrap().first_start(), Some(100), "resumed the next day: still the first start");
 
         // Editing the virtual task doesn't touch the real one.
         let mut t = s.task(id).unwrap().clone();
@@ -614,7 +791,7 @@ mod tests {
         assert_eq!(s.entries_for(day, 0)[0].title, "Standup");
         let next = day.succ_opt().unwrap();
         assert_eq!(s.entries_for(next, 0)[0].title, "Daily");
-        assert_eq!(s.count_for(day), 1);
+        assert_eq!(s.count_shown_on(day), 1);
     }
 
     fn day(m: u32, d: u32) -> NaiveDate {
@@ -659,6 +836,148 @@ mod tests {
     }
 
     #[test]
+    fn giving_up_creates_a_failed_run() {
+        let path = temp_db("failed");
+        let mut s = Store::open(&path).unwrap();
+        let id = s
+            .save_task(test_task("Taxes", Schedule::Date { date: day(11, 5), repeat: Repeat::Never }, 600, 30))
+            .unwrap();
+        let run = s.fail(id, day(11, 5), 100).unwrap();
+        let e = s.entry(id, day(11, 5), 500).unwrap();
+        assert_eq!((e.status, e.run_id, e.tracked_secs), (EntryStatus::Failed, Some(run), 0));
+        assert_eq!(s.run(run).unwrap().finished_at, Some(100));
+        assert_eq!(s.open_runs().count(), 0, "nothing to pause or finish");
+        // stale actions must not turn it into something else
+        s.finish(run, 200).unwrap();
+        s.pause(run, 200).unwrap();
+        assert_eq!(s.fail(id, day(11, 5), 300).unwrap(), run, "giving up twice is the same run");
+        assert_eq!((s.run(run).unwrap().status, s.run(run).unwrap().finished_at), (RunStatus::Failed, Some(100)));
+        drop(s);
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(s.run(run).unwrap().status, RunStatus::Failed, "persisted");
+        // doing it after all: the clock starts, and it can be finished like any other
+        s.resume(run, 1_000).unwrap();
+        assert_eq!(s.open_runs().map(|r| r.id).collect::<Vec<_>>(), [run]);
+        s.finish(run, 1_600).unwrap();
+        let r = s.run(run).unwrap();
+        assert_eq!((r.status, r.tracked_secs(9_999), r.finished_at), (RunStatus::Done, 600, Some(1_600)));
+        assert_eq!(s.open_runs().count(), 0);
+        // a started task can't be given up this way
+        let id2 = s
+            .save_task(test_task("Report", Schedule::Date { date: day(11, 5), repeat: Repeat::Never }, 700, 30))
+            .unwrap();
+        let started = s.start(id2, day(11, 5), 2_000).unwrap();
+        assert_eq!(s.fail(id2, day(11, 5), 2_100).unwrap(), started);
+        assert_eq!(s.run(started).unwrap().status, RunStatus::Running);
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn undo_makes_it_a_planned_task_again() {
+        let path = temp_db("undo");
+        let mut s = Store::open(&path).unwrap();
+        let once = |title: &str| test_task(title, Schedule::Date { date: day(11, 5), repeat: Repeat::Never }, 600, 30);
+        let (a, b, c) =
+            (s.save_task(once("A")).unwrap(), s.save_task(once("B")).unwrap(), s.save_task(once("C")).unwrap());
+        let run_a = s.start(a, day(11, 5), 100).unwrap();
+        let run_b = s.start(b, day(11, 5), 110).unwrap();
+        let run_c = s.fail(c, day(11, 5), 120).unwrap();
+        // B was started from its reminder (which closes it for good), A's reminder is snoozed
+        let closed = NotifState { dismissed: true, snooze_until: None };
+        s.set_notif(&format!("over:{run_b}"), closed).unwrap();
+        s.set_notif(&format!("due:{b}:2026-11-05"), closed).unwrap();
+        s.set_notif(&format!("due:{a}:2026-11-05"), NotifState { dismissed: false, snooze_until: Some(900) }).unwrap();
+        // a started one from the middle, with the others' lookups staying right
+        s.undo_run(run_b).unwrap();
+        assert!(s.run(run_b).is_none());
+        let e = s.entry(b, day(11, 5), 200).unwrap();
+        assert_eq!((e.status, e.run_id, e.tracked_secs), (EntryStatus::Virtual, None, 0), "planned again");
+        assert!(!s.notif(&format!("over:{run_b}")).dismissed, "its reminder state is gone too");
+        assert!(!s.notif(&format!("due:{b}:2026-11-05")).dismissed, "and it is due again");
+        assert_eq!(s.run(run_a).unwrap().title, "A");
+        assert_eq!(s.run(run_c).unwrap().title, "C");
+        assert_eq!(s.open_runs().map(|r| r.id).collect::<Vec<_>>(), [run_a]);
+        assert_eq!((s.runs_on(day(11, 5)).count(), s.runs_of(b).count(), s.count_shown_on(day(11, 5))), (2, 0, 3));
+        // a given-up one, and undoing twice does nothing
+        s.undo_run(run_c).unwrap();
+        s.undo_run(run_a).unwrap();
+        assert_eq!(s.notif(&format!("due:{a}:2026-11-05")).snooze_until, Some(900), "a snooze is kept");
+        let run_a = s.start(a, day(11, 5), 100).unwrap();
+        s.undo_run(run_c).unwrap();
+        assert_eq!(s.entry(c, day(11, 5), 200).unwrap().status, EntryStatus::Virtual);
+        // it can be started again, and the others still work
+        let again = s.start(b, day(11, 5), 300).unwrap();
+        s.pause(run_a, 400).unwrap();
+        assert_eq!(s.run(run_a).unwrap().tracked_secs(999), 300);
+        assert_eq!(s.run(again).unwrap().tracked_secs(360), 60, "nothing left of the undone run's time");
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.runs.len(), 2, "deleted in the database too");
+        assert_eq!(s.run(again).unwrap().segments.len(), 1);
+        assert_eq!(s.entry(c, day(11, 5), 0).unwrap().status, EntryStatus::Virtual);
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tasks_across_midnight_are_on_both_days() {
+        let mut s = Store::open(Path::new(":memory:")).unwrap();
+        let every_day = Schedule::Weekdays { mask: 0b111_1111, from: day(11, 5), every: WeekRepeat::Weekly };
+        let night = s.save_task(test_task("Night shift", every_day, 23 * 60, 120)).unwrap();
+        s.save_task(test_task("Lunch", Schedule::Date { date: day(11, 6), repeat: Repeat::Never }, 12 * 60, 60))
+            .unwrap();
+        let shown = |s: &Store, d: NaiveDate| -> Vec<(String, NaiveDate, (u32, u32))> {
+            s.entries_shown_on(d, 0).iter().map(|e| (e.title.clone(), e.date, e.span_on(d))).collect()
+        };
+        let night_shift = |date: NaiveDate, span: (u32, u32)| ("Night shift".to_string(), date, span);
+        assert_eq!(shown(&s, day(11, 5)), [night_shift(day(11, 5), (23 * 60, 24 * 60))], "the first day: only its own");
+        assert_eq!(
+            shown(&s, day(11, 6)),
+            [
+                night_shift(day(11, 5), (0, 60)),
+                ("Lunch".to_string(), day(11, 6), (12 * 60, 13 * 60)),
+                night_shift(day(11, 6), (23 * 60, 24 * 60)),
+            ],
+            "yesterday's rest first, then the day's own"
+        );
+        assert_eq!(s.entries_for(day(11, 6), 0).len(), 2, "but it belongs to one day only");
+        // the carried-over one is the same occurrence: starting it shows on both days
+        s.start(night, day(11, 5), 100).unwrap();
+        let e = s.entries_shown_on(day(11, 6), 200);
+        assert_eq!((e[0].date, e[0].status), (day(11, 5), EntryStatus::Running));
+        assert_eq!(e[2].status, EntryStatus::Virtual);
+        for d in 4..=8 {
+            assert_eq!(s.count_shown_on(day(11, d)), s.entries_shown_on(day(11, d), 0).len(), "count on day {d}");
+        }
+        // one that ends at midnight stays on its day
+        let mut s = Store::open(Path::new(":memory:")).unwrap();
+        s.save_task(test_task("Late", Schedule::Date { date: day(11, 5), repeat: Repeat::Never }, 23 * 60, 60))
+            .unwrap();
+        assert_eq!((s.count_shown_on(day(11, 5)), s.count_shown_on(day(11, 6))), (1, 0));
+    }
+
+    #[test]
+    fn lookups_follow_task_changes() {
+        let mut s = Store::open(Path::new(":memory:")).unwrap();
+        let once = Schedule::Date { date: day(11, 5), repeat: Repeat::Never };
+        let id = s.save_task(test_task("Move me", once, 600, 30)).unwrap();
+        assert_eq!((s.count_shown_on(day(11, 5)), s.count_shown_on(day(11, 9))), (1, 0));
+        // moved to another day, then made a repeating task, then deleted
+        let mut t = s.task(id).unwrap().clone();
+        t.schedule = Schedule::Date { date: day(11, 9), repeat: Repeat::Never };
+        s.save_task(t.clone()).unwrap();
+        assert_eq!((s.count_shown_on(day(11, 5)), s.count_shown_on(day(11, 9))), (0, 1));
+        t.schedule = Schedule::Weekdays { mask: 0b111_1111, from: day(11, 9), every: WeekRepeat::Weekly };
+        s.save_task(t).unwrap();
+        assert_eq!((s.count_shown_on(day(11, 9)), s.count_shown_on(day(11, 20))), (1, 1));
+        assert_eq!(s.tasks().count(), 1);
+        s.delete_task(id).unwrap();
+        assert_eq!((s.count_shown_on(day(11, 9)), s.tasks().count()), (0, 0));
+        assert!(s.task(id).is_none() && s.entry(id, day(11, 9), 0).is_none());
+    }
+
+    #[test]
     fn everything_survives_a_restart() {
         let path = temp_db("reopen");
         let (id, run) = {
@@ -688,6 +1007,7 @@ mod tests {
         assert_eq!(r.tracked_secs(2_100), 600 + 100 + 300);
         assert_eq!(s.notif("over:1").snooze_until, Some(5_000));
         assert_eq!(s.runs_on(day(11, 6)).count(), 1, "date index rebuilt on load");
+        assert_eq!(s.open_runs().map(|r| r.id).collect::<Vec<_>>(), [run], "and the open runs");
         drop(s);
         let _ = std::fs::remove_file(&path);
     }
@@ -709,7 +1029,7 @@ mod tests {
         s.start(daily, day(11, 6), 100).unwrap();
         for d in 1..=10 {
             let date = day(11, d);
-            assert_eq!(s.count_for(date), s.entries_for(date, 0).len(), "count_for matches on day {d}");
+            assert_eq!(s.count_shown_on(date), s.entries_shown_on(date, 0).len(), "the count matches on day {d}");
         }
         let e = s.entries_for(day(11, 6), 200);
         assert_eq!(
@@ -717,14 +1037,14 @@ mod tests {
             [("Mail", EntryStatus::Running), ("Dentist", EntryStatus::Virtual)]
         );
         assert_eq!(s.entries_for(day(11, 7), 0).len(), 1, "the one-off is only on its day");
-        assert_eq!(s.count_for(day(10, 31)), 0, "nothing before the schedule starts");
+        assert_eq!(s.count_shown_on(day(10, 31)), 0, "nothing before the schedule starts");
 
         // Deleting a task keeps its history but stops planning it.
         s.delete_task(daily).unwrap();
         let e = s.entries_for(day(11, 6), 200);
         assert_eq!(e.len(), 2);
         assert!(!e[0].task_exists, "run of a deleted task is shown without edit buttons");
-        assert_eq!(s.count_for(day(11, 8)), 0);
+        assert_eq!(s.count_shown_on(day(11, 8)), 0);
         assert!(s.start(daily, day(11, 8), 300).is_err(), "deleted tasks can't be started");
         assert!(s.task(once).is_some());
     }
@@ -766,9 +1086,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// One frame's store queries (month grid, week list, day view) with 3 years of
-    /// history for 20 daily tasks. Must not grow with the history (it did before the
-    /// date index: ~1 ms per frame here, now ~15 µs).
+    /// One frame's store queries (month grid, week list, day view, reminders, panel icon)
+    /// with 3 years of history for 20 daily tasks plus one finished one-off task per day.
+    /// Must not grow with the history (it did before the lookups in `Index`).
     /// `cargo test --release frame_queries -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -781,8 +1101,9 @@ mod tests {
             .collect();
         let today = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
         let mut d = from;
-        while d < today {
-            for &id in &ids {
+        while d < today - Duration::days(30) {
+            let once = s.save_task(test_task("Once", Schedule::Date { date: d, repeat: Repeat::Never }, 600, 15));
+            for id in ids.iter().copied().chain(once) {
                 let r = s.start(id, d, 1000).unwrap();
                 s.finish(r, 1600).unwrap();
             }
@@ -792,9 +1113,13 @@ mod tests {
         let t0 = std::time::Instant::now();
         for _ in 0..frames {
             let first = today - Duration::days(20);
-            let cells: usize = (0..42).map(|i| s.count_for(first + Duration::days(i))).sum();
-            let rows: usize = (0..8).map(|i| s.entries_for(today - Duration::days(i), 0).len()).sum();
-            assert_eq!((cells, rows), (42 * 20, 8 * 20));
+            let cells: usize = (0..42).map(|i| s.count_shown_on(first + Duration::days(i))).sum();
+            let rows: usize = (0..8).map(|i| s.entries_shown_on(today - Duration::days(i), 0).len()).sum();
+            // the reminder check and the panel icon's list
+            let open = s.open_runs().count()
+                + (-1..=1).map(|i| s.entries_for(today + Duration::days(i), 0).len()).sum::<usize>();
+            let found = ids.iter().filter(|&&id| s.task(id).is_some() && s.run(id).is_some()).count();
+            assert_eq!((cells, rows, open, found), (42 * 20, 8 * 20, 3 * 20, 20));
         }
         println!("{} runs: {:?} per frame", s.runs.len(), t0.elapsed() / frames);
     }

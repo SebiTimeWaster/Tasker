@@ -9,7 +9,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::icon::IconState;
-use crate::tray::{self as model, MenuEntry, RunningTask, UiMsg};
+use crate::tray::{self as model, MenuEntry, TrayTask, UiMsg};
 
 /// Lives on the main (UI) thread, which runs the Windows message loop.
 pub struct Tray(TrayIcon);
@@ -19,7 +19,7 @@ fn icon(state: IconState) -> Option<Icon> {
     Icon::from_rgba(crate::icon::render(32, state), 32, 32).ok()
 }
 
-fn menu(running: &[RunningTask]) -> Menu {
+fn menu(running: &[TrayTask]) -> Menu {
     let menu = Menu::new();
     for e in model::menu(running) {
         // `&` marks a mnemonic in Windows menus; show it literally.
@@ -75,7 +75,7 @@ impl Tray {
     }
 
     /// Update icon color, tooltip and menu.
-    pub fn set_running(&self, running: Vec<RunningTask>) {
+    pub fn set_tasks(&self, running: Vec<TrayTask>) {
         let _ = self.0.set_icon(icon(model::icon_state(&running)));
         let tip = model::tooltip(&running);
         let _ = self.0.set_tooltip(Some(if tip.is_empty() { "Tasker".to_string() } else { format!("Tasker\n{tip}") }));

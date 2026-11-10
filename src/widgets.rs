@@ -6,37 +6,56 @@ use egui::{Color32, CornerRadius, RichText, Ui};
 use crate::action::Action;
 use crate::model::*;
 
+/// Background of a task that was given up, in the day view and the statistics.
+pub const FAILED_RED: Color32 = Color32::from_rgb(96, 24, 24);
+
 pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
+/// A button in the look of the task buttons (white text, optionally colored).
+pub fn task_button(ui: &mut Ui, text: &str, fill: Option<Color32>, enabled: bool) -> egui::Response {
+    let mut btn = egui::Button::new(RichText::new(text).color(Color32::WHITE)).corner_radius(CornerRadius::same(4));
+    if let Some(f) = fill {
+        btn = btn.fill(f);
+    }
+    ui.add_enabled(enabled, btn)
+}
+
+/// The button that gives a task up (marks it as failed).
+const GIVE_UP: &str = "I am bad and won't do it";
+
 /// The state-dependent buttons of a task, shared by the task list and the notifications.
-pub fn task_buttons(ui: &mut Ui, e: &Entry) -> Option<Action> {
+/// `give_up_wait` is the number of seconds until the give-up button can be clicked; it is
+/// counted down in the button (0 = it can be clicked).
+pub fn task_buttons(ui: &mut Ui, e: &Entry, give_up_wait: u64) -> Option<Action> {
     let mut out = None;
     let green = Color32::from_rgb(46, 125, 70);
-    let mut b = |ui: &mut Ui, text: &str, fill: Option<Color32>, a: Action| {
-        let mut btn = egui::Button::new(RichText::new(text).color(Color32::WHITE)).corner_radius(CornerRadius::same(4));
-        if let Some(f) = fill {
-            btn = btn.fill(f);
-        }
-        if ui.add(btn).clicked() {
+    let mut b = |ui: &mut Ui, text: &str, fill: Option<Color32>, enabled: bool, a: Action| {
+        if task_button(ui, text, fill, enabled).clicked() {
             out = Some(a);
         }
     };
     match (e.status, e.run_id) {
         (EntryStatus::Virtual, _) => {
-            b(ui, "▶ Start task", Some(green), Action::Start { task_id: e.task_id, date: e.date })
+            b(ui, "▶ Start task", Some(green), true, Action::Start { task_id: e.task_id, date: e.date });
+            let give_up = Action::Fail { task_id: e.task_id, date: e.date };
+            match give_up_wait {
+                0 => b(ui, GIVE_UP, None, true, give_up),
+                secs => b(ui, &format!("{GIVE_UP} ({secs})"), None, false, give_up),
+            }
         }
         (EntryStatus::Running, Some(id)) => {
-            b(ui, "⏸ Pause", None, Action::Pause(id));
-            b(ui, "✔ Finish", Some(green), Action::Finish(id));
+            b(ui, "⏸ Pause", None, true, Action::Pause(id));
+            b(ui, "✔ Finish", Some(green), true, Action::Finish(id));
         }
         (EntryStatus::Paused, Some(id)) => {
-            b(ui, "▶ Continue", Some(green), Action::Resume(id));
-            b(ui, "✔ Finish", None, Action::Finish(id));
+            b(ui, "▶ Continue", Some(green), true, Action::Resume(id));
+            b(ui, "✔ Finish", None, true, Action::Finish(id));
         }
-        (EntryStatus::Done, Some(id)) => b(ui, "⟲ Resume", None, Action::Resume(id)),
+        (EntryStatus::Done, Some(id)) => b(ui, "⟲ Resume", None, true, Action::Resume(id)),
+        (EntryStatus::Failed, Some(id)) => b(ui, "▶ Do it after all", None, true, Action::Resume(id)),
         _ => {}
     }
     out

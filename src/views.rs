@@ -15,7 +15,7 @@ use crate::action::Action;
 use crate::app::{GRID_LINE, TaskerApp, now_min, now_ts, snoozed_until, today};
 use crate::dialogs::Editor;
 use crate::model::*;
-use crate::widgets::{start_offset_labels, task_buttons};
+use crate::widgets::{FAILED_RED, start_offset_labels, task_button, task_buttons};
 
 const ACCENT: Color32 = Color32::from_rgb(90, 140, 210);
 
@@ -29,7 +29,7 @@ pub fn elided(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> 
 
 pub fn left_column(app: &mut TaskerApp, ui: &mut Ui) {
     let store = &app.store;
-    let counts = |d: NaiveDate| store.count_for(d);
+    let counts = |d: NaiveDate| store.count_shown_on(d);
     let mut month = app.month;
     let mut selected = app.selected;
     month_header(ui, &mut month, &mut selected, true);
@@ -152,15 +152,16 @@ pub fn month_grid(
     }
 }
 
+/// The entry of `date` (out of the ones shown on it) to name in the week list.
 fn next_task(entries: &[Entry], date: NaiveDate) -> Option<&Entry> {
-    let mut open = entries.iter().filter(|e| e.status != EntryStatus::Done);
+    let mut open = entries.iter().filter(|e| !e.status.is_closed());
     if date == today() {
-        let nm = now_min();
+        let nm = now_min() as i64;
         // running first, then the next upcoming one, then the oldest overdue one
         entries
             .iter()
             .find(|e| e.status == EntryStatus::Running)
-            .or_else(|| entries.iter().find(|e| e.status != EntryStatus::Done && e.start_min >= nm))
+            .or_else(|| entries.iter().find(|e| !e.status.is_closed() && e.start_on(date) >= nm))
             .or_else(|| open.next())
     } else {
         open.next()
@@ -186,7 +187,7 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
         } else if resp.hovered() {
             p.rect_filled(r.shrink2(egui::vec2(0.0, 1.0)), 0.0, Color32::from_gray(40));
         }
-        let entries = app.store.entries_for(d, now);
+        let entries = app.store.entries_shown_on(d, now);
         let name_col = if d == today { Color32::from_rgb(240, 200, 90) } else { Color32::from_gray(230) };
         let big = (row_h * 0.3).clamp(13.0, 18.0);
         let x = r.left() + 8.0;
@@ -206,6 +207,8 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
         );
         let total = entries.len();
         let done = entries.iter().filter(|e| e.status == EntryStatus::Done).count();
+        let failed = entries.iter().filter(|e| e.status == EntryStatus::Failed).count();
+        let (green, red) = (Color32::from_rgb(110, 170, 120), Color32::from_rgb(215, 95, 85));
         p.text(
             egui::pos2(r.right() - 10.0, r.center().y),
             Align2::RIGHT_CENTER,
@@ -214,7 +217,9 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
             if total == 0 {
                 Color32::from_gray(90)
             } else if done == total {
-                Color32::from_rgb(110, 170, 120)
+                green
+            } else if done + failed == total {
+                red
             } else {
                 Color32::WHITE
             },
@@ -229,13 +234,9 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
             }
         } else if total > 0 {
             let y = r.top() + 8.0 + big + 4.0;
-            p.text(
-                egui::pos2(x, y),
-                Align2::LEFT_TOP,
-                "all done ✔",
-                FontId::proportional(12.0),
-                Color32::from_rgb(110, 170, 120),
-            );
+            let (text, color) =
+                if failed == 0 { ("all done ✔".to_string(), green) } else { (format!("{failed} failed ✖"), red) };
+            p.text(egui::pos2(x, y), Align2::LEFT_TOP, text, FontId::proportional(12.0), color);
         }
         p.hline(rect.x_range(), r.bottom(), Stroke::new(1.0, GRID_LINE));
         if resp.clicked() {
@@ -261,7 +262,9 @@ pub fn day_view(app: &mut TaskerApp, ui: &mut Ui) {
     let body = Rect::from_min_max(egui::pos2(list.left(), header.bottom()), list.max);
 
     let now = now_ts();
-    let entries = app.store.entries_for(app.selected, now);
+    let day = app.selected;
+    // Includes the entries of the day before that reach past midnight: they are on both days.
+    let entries = app.store.entries_shown_on(day, now);
 
     // ---- header
     let p = ui.painter().clone();
@@ -274,9 +277,15 @@ pub fn day_view(app: &mut TaskerApp, ui: &mut Ui) {
         Color32::WHITE,
     );
     let done = entries.iter().filter(|e| e.status == EntryStatus::Done).count();
-    let est: u32 = entries.iter().map(|e| e.estimate_min).sum();
-    let tracked: i64 = entries.iter().map(|e| e.tracked_secs).sum();
-    let short = format!("{} tasks · {} done", entries.len(), done);
+    let failed = entries.iter().filter(|e| e.status == EntryStatus::Failed).count();
+    // Planned: only what lies on this day (the rest of a task that crosses midnight counts
+    // for the other day). Tracked time can't be split like that; it counts for the task's own day.
+    let est: u32 = entries.iter().map(|e| e.span_on(day)).map(|(start, end)| end - start).sum();
+    let tracked: i64 = entries.iter().filter(|e| e.date == day).map(|e| e.tracked_secs).sum();
+    let mut short = format!("{} tasks · {} done", entries.len(), done);
+    if failed > 0 {
+        short.push_str(&format!(" · {failed} failed"));
+    }
     let long =
         format!("{short} · planned {} · tracked {}", fmt_duration_min(est), fmt_duration_min((tracked / 60) as u32));
     // drop the details when the window is too narrow for them
@@ -311,7 +320,8 @@ pub fn day_view(app: &mut TaskerApp, ui: &mut Ui) {
                 });
             }
             for e in &entries {
-                let (r, a) = task_row(ui, e, now, snoozed_until(&app.store, e));
+                let undo_secs = e.run_id.and_then(|id| app.undo_secs_left(id));
+                let (r, a) = task_row(ui, e, day, now, snoozed_until(&app.store, e), undo_secs);
                 ui.painter().hline(ui.max_rect().x_range(), r.bottom(), Stroke::new(1.0, GRID_LINE));
                 rows.push(r);
                 if a.is_some() {
@@ -322,13 +332,13 @@ pub fn day_view(app: &mut TaskerApp, ui: &mut Ui) {
         .inner_rect;
 
     // ---- timeline
-    timeline(ui, tl, &entries, app.selected == today());
+    timeline(ui, tl, &entries, day);
 
     // ---- connectors
-    connectors(ui, tl, gap, viewport, &entries, &rows);
+    connectors(ui, tl, gap, viewport, &entries, day, &rows);
 
     if let Some(a) = action {
-        app.apply(a);
+        app.apply_click(a);
     }
 }
 
@@ -336,7 +346,9 @@ fn minute_y(tl: Rect, min: u32) -> f32 {
     tl.top() + tl.height() * (min as f32 / (24.0 * 60.0))
 }
 
-fn timeline(ui: &Ui, tl: Rect, entries: &[Entry], is_today: bool) {
+/// The 24 h ruler of `day` with each entry's planned time on it: for a task that crosses
+/// midnight, the part that lies on this day.
+fn timeline(ui: &Ui, tl: Rect, entries: &[Entry], day: NaiveDate) {
     let p = ui.painter_at(tl.expand2(egui::vec2(0.0, 1.0)));
     p.rect_filled(tl, 0.0, Color32::from_gray(26));
     let hour_h = tl.height() / 24.0;
@@ -365,18 +377,18 @@ fn timeline(ui: &Ui, tl: Rect, entries: &[Entry], is_today: bool) {
     // task spans, packed into lanes so overlaps stay visible
     let mut lane_end: Vec<u32> = Vec::new();
     for e in entries {
-        let lane = lane_end.iter().position(|&end| end <= e.start_min).unwrap_or_else(|| {
+        let (start, end) = e.span_on(day);
+        let lane = lane_end.iter().position(|&lane_end| lane_end <= start).unwrap_or_else(|| {
             lane_end.push(0);
             lane_end.len() - 1
         });
-        lane_end[lane] = e.end_min().max(e.start_min + 1);
+        lane_end[lane] = end.max(start + 1);
         let x = tl.right() - 6.0 - lane as f32 * 6.0;
-        let (y0, y1) = (minute_y(tl, e.start_min), minute_y(tl, e.end_min()).max(minute_y(tl, e.start_min) + 2.0));
-        let col =
-            if e.status == EntryStatus::Done { e.priority.color().gamma_multiply(0.35) } else { e.priority.color() };
+        let (y0, y1) = (minute_y(tl, start), minute_y(tl, end).max(minute_y(tl, start) + 2.0));
+        let col = if e.status.is_closed() { e.priority.color().gamma_multiply(0.35) } else { e.priority.color() };
         p.rect_filled(Rect::from_x_y_ranges(x - 2.0..=x + 2.0, y0..=y1), 2.0, col);
     }
-    if is_today {
+    if day == today() {
         let y = minute_y(tl, now_min());
         p.hline(tl.x_range(), y, Stroke::new(1.5, Color32::from_rgb(235, 80, 80)));
         p.circle_filled(egui::pos2(tl.left() + 3.0, y), 3.0, Color32::from_rgb(235, 80, 80));
@@ -397,8 +409,9 @@ fn s_curve(a: Pos2, b: Pos2, n: usize) -> Vec<Pos2> {
         .collect()
 }
 
-/// Join each task row's top/bottom divider to its start/end time on the timeline.
-fn connectors(ui: &Ui, tl: Rect, gap: Rect, viewport: Rect, entries: &[Entry], rows: &[Rect]) {
+/// Join each task row's top/bottom divider to its start/end time on the timeline of `day`
+/// (midnight where the task goes on before or after this day).
+fn connectors(ui: &Ui, tl: Rect, gap: Rect, viewport: Rect, entries: &[Entry], day: NaiveDate, rows: &[Rect]) {
     let clip = Rect::from_min_max(gap.min, egui::pos2(gap.right() + 1.0, gap.bottom()));
     let p = ui.painter_at(clip);
     let clamp = |y: f32| y.clamp(viewport.top(), viewport.bottom());
@@ -406,11 +419,12 @@ fn connectors(ui: &Ui, tl: Rect, gap: Rect, viewport: Rect, entries: &[Entry], r
         if r.bottom() < viewport.top() - 400.0 || r.top() > viewport.bottom() + 400.0 {
             continue;
         }
-        let (t0, t1) = (minute_y(tl, e.start_min), minute_y(tl, e.end_min()));
+        let (start, end) = e.span_on(day);
+        let (t0, t1) = (minute_y(tl, start), minute_y(tl, end));
         let (r0, r1) = (clamp(r.top()), clamp(r.bottom()));
         let top = s_curve(egui::pos2(gap.left(), t0), egui::pos2(gap.right(), r0), 24);
         let bot = s_curve(egui::pos2(gap.left(), t1), egui::pos2(gap.right(), r1), 24);
-        let done = e.status == EntryStatus::Done;
+        let done = e.status.is_closed();
         let fill = e.priority.color().gamma_multiply(if done { 0.07 } else { 0.16 });
         let mut mesh = Mesh::default();
         for (a, b) in top.iter().zip(&bot) {
@@ -444,14 +458,26 @@ fn status_chip(ui: &mut Ui, text: &str, color: Color32) {
         });
 }
 
-/// One task in the list. Takes as much height as its content needs.
-fn task_row(ui: &mut Ui, e: &Entry, now: i64, snoozed: Option<i64>) -> (Rect, Option<Action>) {
+/// One task in the list of `day`. Takes as much height as its content needs. Done tasks
+/// are faded; a task that was given up has a dark red background. `undo_secs`: it was
+/// started or given up here a moment ago and has an Undo button for that many more seconds.
+fn task_row(
+    ui: &mut Ui,
+    e: &Entry,
+    day: NaiveDate,
+    now: i64,
+    snoozed: Option<i64>,
+    undo_secs: Option<u64>,
+) -> (Rect, Option<Action>) {
     let mut action = None;
-    let done = e.status == EntryStatus::Done;
-    let resp = Frame::new().inner_margin(Margin { left: 16, right: 12, top: 9, bottom: 10 }).show(ui, |ui| {
+    let failed = e.status == EntryStatus::Failed;
+    let done = e.status.is_closed();
+    let fill = if failed { FAILED_RED } else { Color32::TRANSPARENT };
+    let margin = Margin { left: 16, right: 12, top: 9, bottom: 10 };
+    let resp = Frame::new().fill(fill).inner_margin(margin).show(ui, |ui| {
         ui.set_width(ui.available_width());
         if done {
-            ui.multiply_opacity(0.5);
+            ui.multiply_opacity(if failed { 0.8 } else { 0.5 });
         }
         ui.spacing_mut().item_spacing.y = 5.0;
         // title line
@@ -462,6 +488,7 @@ fn task_row(ui: &mut Ui, e: &Entry, now: i64, snoozed: Option<i64>) -> (Rect, Op
                 EntryStatus::Running => status_chip(ui, "running", Color32::from_rgb(110, 200, 130)),
                 EntryStatus::Paused => status_chip(ui, "paused", Color32::from_rgb(230, 180, 80)),
                 EntryStatus::Done => status_chip(ui, "done", Color32::from_rgb(140, 170, 150)),
+                EntryStatus::Failed => status_chip(ui, "failed", Color32::from_rgb(240, 120, 110)),
             }
             if e.recurring {
                 ui.label(RichText::new("⟳").color(Color32::from_gray(160))).on_hover_text("Recurring task");
@@ -485,9 +512,8 @@ fn task_row(ui: &mut Ui, e: &Entry, now: i64, snoozed: Option<i64>) -> (Rect, Op
         });
         // meta line
         let mut meta = format!(
-            "{} – {}   ·   est. {}   ·   {} priority   ·   {} {}",
-            fmt_hm(e.start_min),
-            fmt_hm(e.end_min()),
+            "{}   ·   est. {}   ·   {} priority   ·   {} {}",
+            e.time_span_on(day),
             fmt_duration_min(e.estimate_min),
             e.priority.label(),
             e.notify.icon(),
@@ -568,18 +594,18 @@ fn task_row(ui: &mut Ui, e: &Entry, now: i64, snoozed: Option<i64>) -> (Rect, Op
         }
         // buttons
         ui.horizontal(|ui| {
-            if let Some(a) = task_buttons(ui, e) {
+            if let Some(a) = task_buttons(ui, e, 0) {
                 action = Some(a);
             }
-            if !done {
-                start_offset_labels(ui, e, now, snoozed, false);
+            if let (Some(secs), Some(id)) = (undo_secs, e.run_id) {
+                let tip = "Clicked by accident? This takes it back: the task is planned again \
+                           (and time tracked since then is dropped)";
+                if task_button(ui, &format!("↩ Undo ({secs})"), None, true).on_hover_text(tip).clicked() {
+                    action = Some(Action::Undo(id));
+                }
             }
-            if let (true, Some(fin)) = (done, e.finished_at)
-                && let Some(dt) = chrono::DateTime::from_timestamp(fin, 0)
-            {
-                let local = dt.with_timezone(&chrono::Local);
-                ui.label(RichText::new(format!("finished {}", local.format("%H:%M"))).color(Color32::from_gray(170)));
-            }
+            // how early or late it was first started (resumes don't change that)
+            start_offset_labels(ui, e, now, snoozed.filter(|_| !done), false);
         });
     });
     let r = resp.response.rect;

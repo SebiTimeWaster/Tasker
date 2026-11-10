@@ -11,6 +11,7 @@ use crate::platform;
 use crate::settings::{Corner, DEFAULT_SNOOZE, Settings, SoundChoice, UI_SCALE_PCT, fmt_snooze};
 use crate::store::Store;
 use crate::views::{month_grid, month_header};
+use crate::widgets::FAILED_RED;
 
 /// Dragging a number field changes it by one step per this many points of mouse travel.
 pub const DRAG_POINTS_PER_STEP: f64 = 3.0;
@@ -599,18 +600,20 @@ const STATS_MAX_POINTS: usize = 30;
 
 struct Point {
     date: NaiveDate,
+    /// None: not worked on (missed or given up).
     tracked_min: Option<f32>,
     estimate_min: u32,
     delay_min: Option<i64>,
     done: bool,
+    /// Given up ("I am bad and won't do it") instead of just missed.
+    failed: bool,
 }
 
-fn stats_points(store: &Store, task: &Task) -> Vec<Point> {
-    let today = Local::now().date_naive();
-    let runs: Vec<&Run> = store.runs.iter().filter(|r| r.task_id == task.id).collect();
+/// The occurrences of `task` up to `today` (timestamp `now`), oldest first.
+fn stats_points(store: &Store, task: &Task, today: NaiveDate, now: i64) -> Vec<Point> {
+    let runs: Vec<&Run> = store.runs_of(task.id).collect();
     let start =
         runs.iter().map(|r| r.date).chain([task.schedule.first_date()]).min().unwrap().max(today - Duration::days(400));
-    let now = Local::now().timestamp();
     let mut pts = Vec::new();
     let mut d = start;
     while d <= today {
@@ -620,20 +623,27 @@ fn stats_points(store: &Store, task: &Task) -> Vec<Point> {
                 Some(r) => {
                     // Same rounding as the "started 5 min late" labels.
                     let delay = r.first_start().map(|s| minutes_from_start(d, r.start_min, s));
+                    let failed = r.status == RunStatus::Failed;
                     Point {
                         date: d,
-                        tracked_min: Some(r.tracked_secs(now) as f32 / 60.0),
+                        tracked_min: (!failed).then(|| r.tracked_secs(now) as f32 / 60.0),
                         estimate_min: r.estimate_min,
                         delay_min: delay,
                         done: r.status == RunStatus::Done,
+                        failed,
                     }
                 }
-                None => {
-                    Point { date: d, tracked_min: None, estimate_min: task.estimate_min, delay_min: None, done: false }
-                }
+                None => Point {
+                    date: d,
+                    tracked_min: None,
+                    estimate_min: task.estimate_min,
+                    delay_min: None,
+                    done: false,
+                    failed: false,
+                },
             };
             // today's not-yet-started occurrence isn't "missed" yet
-            if !(d == today && p.tracked_min.is_none()) {
+            if !(d == today && run.is_none()) {
                 pts.push(p);
             }
         }
@@ -643,7 +653,6 @@ fn stats_points(store: &Store, task: &Task) -> Vec<Point> {
     pts.into_iter().skip(skip).collect()
 }
 
-/// Returns false when closed.
 pub enum ListResult {
     Open,
     Close,
@@ -680,17 +689,15 @@ fn task_list_row(ui: &mut Ui, t: &Task, info: &str, info_color: Color32) -> bool
 /// yet (started ones are done with planning). One line each, with an edit button.
 pub fn task_list_ui(ctx: &egui::Context, store: &Store) -> ListResult {
     let mut res = ListResult::Open;
-    let mut recurring: Vec<&Task> = store.tasks.iter().filter(|t| !t.deleted && t.schedule.is_recurring()).collect();
+    let mut recurring: Vec<&Task> = store.tasks().filter(|t| t.schedule.is_recurring()).collect();
     recurring.sort_by_key(|t| (t.start_min, t.title.to_lowercase()));
-    let started: std::collections::HashSet<i64> = store.runs.iter().map(|r| r.task_id).collect();
-    let mut one_off: Vec<&Task> =
-        store.tasks.iter().filter(|t| !t.deleted && !t.schedule.is_recurring() && !started.contains(&t.id)).collect();
+    let started = |t: &Task| store.runs_of(t.id).next().is_some();
+    let mut one_off: Vec<&Task> = store.tasks().filter(|t| !t.schedule.is_recurring() && !started(t)).collect();
     one_off.sort_by_key(|t| (t.schedule.first_date(), t.start_min, t.title.to_lowercase()));
     let today = Local::now().date_naive();
     let screen = ctx.content_rect().size();
     let span = |t: &Task| {
-        let end = (t.start_min + t.estimate_min).min(24 * 60);
-        format!("{} – {}   ·   est. {}", fmt_hm(t.start_min), fmt_hm(end), fmt_duration_min(t.estimate_min))
+        format!("{}   ·   est. {}", fmt_time_span(t.start_min, t.estimate_min, false), fmt_duration_min(t.estimate_min))
     };
     let section = |ui: &mut Ui, title: &str, n: usize| {
         ui.horizontal(|ui| {
@@ -758,9 +765,11 @@ pub fn task_list_ui(ctx: &egui::Context, store: &Store) -> ListResult {
     res
 }
 
+/// Returns false when closed.
 pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
     let Some(task) = store.task(task_id) else { return false };
-    let pts = stats_points(store, task);
+    let now = Local::now();
+    let pts = stats_points(store, task, now.date_naive(), now.timestamp());
     let mut open = true;
     let modal = Modal::new(Id::unique("stats")).show(ctx, |ui| {
         ui.set_width(680.0);
@@ -791,6 +800,7 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
         let n = pts.len();
         let started: Vec<&Point> = pts.iter().filter(|p| p.tracked_min.is_some()).collect();
         let done = pts.iter().filter(|p| p.done).count();
+        let failed = pts.iter().filter(|p| p.failed).count();
         let avg = |v: &[f32]| if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 };
         let tracked: Vec<f32> = started.iter().filter_map(|p| p.tracked_min).collect();
         let delays: Vec<i64> = started.iter().filter_map(|p| p.delay_min).collect();
@@ -825,6 +835,7 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
             kv(ui, "Avg. start delay", if delays.is_empty() { "–".into() } else { format!("{avg_delay:+.0} min") });
             ui.end_row();
             kv(ui, "Total tracked", fmt_duration_min(tracked.iter().sum::<f32>().round() as u32));
+            kv(ui, "Given up / missed", format!("{failed} / {}", n - started.len() - failed));
             ui.end_row();
         });
         ui.add_space(10.0);
@@ -862,7 +873,6 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
             let ey = y_of(pt.estimate_min as f32);
             est_line.push(egui::pos2(cx - slot / 2.0, ey));
             est_line.push(egui::pos2(cx + slot / 2.0, ey));
-            let bar_rect;
             match pt.tracked_min {
                 Some(v) => {
                     let col = if v <= pt.estimate_min as f32 {
@@ -870,21 +880,20 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
                     } else {
                         Color32::from_rgb(220, 130, 60)
                     };
-                    bar_rect = Rect::from_min_max(
+                    let bar = Rect::from_min_max(
                         egui::pos2(cx - bw / 2.0, y_of(v).min(plot.bottom() - 1.0)),
                         egui::pos2(cx + bw / 2.0, plot.bottom()),
                     );
-                    p.rect_filled(bar_rect, 2.0, if pt.done { col } else { col.gamma_multiply(0.6) });
+                    p.rect_filled(bar, 2.0, if pt.done { col } else { col.gamma_multiply(0.6) });
                 }
+                // not worked on: a cross, on dark red if it was given up
                 None => {
-                    bar_rect = Rect::from_center_size(egui::pos2(cx, plot.bottom() - 8.0), egui::vec2(bw, 16.0));
-                    p.text(
-                        bar_rect.center(),
-                        Align2::CENTER_CENTER,
-                        "✕",
-                        FontId::proportional(12.0),
-                        Color32::from_rgb(210, 80, 80),
-                    );
+                    let mark = Rect::from_center_size(egui::pos2(cx, plot.bottom() - 8.0), egui::vec2(bw, 16.0));
+                    if pt.failed {
+                        p.rect_filled(mark, 2.0, FAILED_RED);
+                    }
+                    let col = if pt.failed { Color32::from_rgb(240, 150, 140) } else { Color32::from_rgb(210, 80, 80) };
+                    p.text(mark.center(), Align2::CENTER_CENTER, "✕", FontId::proportional(12.0), col);
                 }
             }
             // punctuality dot
@@ -921,10 +930,10 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
                         .unwrap_or_default(),
                     if pt.done { "done" } else { "not finished" }
                 ),
+                None if pt.failed => format!("{}\ngiven up (marked as failed)", pt.date.format("%a %d.%m.%Y")),
                 None => format!("{}\nmissed (not started)", pt.date.format("%a %d.%m.%Y")),
             };
             ui.interact(hover, Id::unique(("stat-bar", i)), Sense::hover()).on_hover_text(tip);
-            let _ = bar_rect;
         }
         // Started occurrences keep the estimate they had when started (dashed, only where it
         // differs); the solid line is the task's current estimate.
@@ -1210,7 +1219,7 @@ mod tests {
 
     #[test]
     fn statistics_points() {
-        let today = Local::now().date_naive();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
         let mut s = Store::open(Path::new(":memory:")).unwrap();
         let from = today - Duration::days(4);
         let id = s
@@ -1221,11 +1230,13 @@ mod tests {
                 30,
             ))
             .unwrap();
-        // day 1 started 5 min late and worked 20 min; days 2 and 3 missed; today not started
+        // day 0 missed; day 1 started 5 min late and worked 20 min; day 2 missed; day 3 given
+        // up; today not started
         let late = scheduled_at(from + Duration::days(1), 8 * 60 + 5).and_local_timezone(Local).unwrap().timestamp();
         let run = s.start(id, from + Duration::days(1), late).unwrap();
         s.finish(run, late + 20 * 60).unwrap();
-        let pts = stats_points(&s, s.task(id).unwrap());
+        s.fail(id, from + Duration::days(3), late).unwrap();
+        let pts = stats_points(&s, s.task(id).unwrap(), today, late + 30 * 60);
         assert_eq!(
             pts.iter().map(|p| p.date).collect::<Vec<_>>(),
             (0..4).map(|i| from + Duration::days(i)).collect::<Vec<_>>(),
@@ -1235,5 +1246,7 @@ mod tests {
         assert_eq!(pts[1].delay_min, Some(5));
         assert!(pts[1].done);
         assert!(pts[0].tracked_min.is_none() && pts[2].tracked_min.is_none(), "missed days");
+        assert!(!pts[0].failed && !pts[2].failed, "missed isn't given up");
+        assert!(pts[3].failed && pts[3].tracked_min.is_none() && !pts[3].done, "given up");
     }
 }

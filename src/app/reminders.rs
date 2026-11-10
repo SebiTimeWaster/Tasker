@@ -9,7 +9,7 @@ use egui::{
     ViewportId,
 };
 
-use super::{TaskerApp, now_min, now_ts, today};
+use super::{TaskerApp, minute_of_day, now_ts};
 use crate::action::Action;
 use crate::audio::PlayRequest;
 use crate::model::*;
@@ -24,6 +24,9 @@ const NOTIF_GAP: f32 = 10.0;
 const OVERDUE_FULL_RED_MIN: f32 = 60.0;
 /// The "starts soon" announcement closes on its own after this long.
 const AHEAD_SHOW_SECS: u64 = 10;
+/// A due reminder has to be endured (sound included) for this long before its
+/// "I am bad and won't do it" button can be clicked. Deliberately not a setting.
+const GIVE_UP_WAIT_SECS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NotifKind {
@@ -44,8 +47,9 @@ impl NotifKind {
             NotifKind::Ahead { task_id, date } => format!("ahead:{task_id}:{date}"),
         }
     }
-    /// A due reminder can only be snoozed or resolved by starting the task; it is meant
-    /// to stay annoying. Over-estimate reminders and announcements can be dismissed.
+    /// A due reminder can only be snoozed or resolved by starting the task or giving it
+    /// up; it is meant to stay annoying. Over-estimate reminders and announcements can be
+    /// dismissed.
     fn dismissable(&self) -> bool {
         !matches!(self, NotifKind::Due { .. })
     }
@@ -54,6 +58,7 @@ impl NotifKind {
 pub(super) struct Notif {
     kind: NotifKind,
     seq: u64,
+    opened_at: Instant,
     /// After clicking a task button the notification stays for a second, then closes.
     closing_at: Option<Instant>,
     /// Closes on its own at this time (announcements).
@@ -74,8 +79,11 @@ enum NotifAction {
 
 impl TaskerApp {
     pub(super) fn tick_notifications(&mut self) {
-        let now = now_ts();
-        let mut wanted = wanted_reminders(&self.store, today(), now_min(), now);
+        // One reading of the clock for all three: around midnight, separate ones could
+        // disagree about the day.
+        let local = Local::now();
+        let now = local.timestamp();
+        let mut wanted = wanted_reminders(&self.store, local.date_naive(), minute_of_day(local.time()), now);
 
         let instant = Instant::now();
         // Announcements that timed out count as dismissed (they don't come back).
@@ -109,6 +117,7 @@ impl TaskerApp {
                 self.notifs.push(Notif {
                     kind: k,
                     seq: self.notif_seq,
+                    opened_at: instant,
                     closing_at: None,
                     expires_at: matches!(k, NotifKind::Ahead { .. })
                         .then(|| instant + Duration::from_secs(AHEAD_SHOW_SECS)),
@@ -150,7 +159,7 @@ impl TaskerApp {
     fn notif_entry(&self, kind: NotifKind, now: i64) -> Option<Entry> {
         match kind {
             NotifKind::Due { task_id, date } | NotifKind::Ahead { task_id, date } => {
-                self.store.entries_for(date, now).into_iter().find(|e| e.task_id == task_id)
+                self.store.entry(task_id, date, now)
             }
             NotifKind::Overrun { run_id } => {
                 let r = self.store.run(run_id)?;
@@ -231,6 +240,7 @@ impl TaskerApp {
                 .with_window_type(egui::X11WindowType::Utility);
             let closing = n.closing_at.is_some();
             let expires_in = n.expires_at.map(|t| t.saturating_duration_since(Instant::now()));
+            let give_up_wait = give_up_wait_secs(n.opened_at.elapsed());
             let id = ViewportId::from_hash_of(("tasker-notif", n.seq));
             let this = &*self;
             let action = ctx.show_viewport_immediate(id, builder, |ui, _class| {
@@ -248,7 +258,7 @@ impl TaskerApp {
                         return Some(NotifAction::Dismiss);
                     }
                 }
-                this.notification_ui(ui, kind, &entry, closing, expires_in, now)
+                this.notification_ui(ui, kind, &entry, closing, expires_in, give_up_wait, now)
             });
             if let Some(a) = action {
                 actions.push((i, a));
@@ -273,7 +283,7 @@ impl TaskerApp {
             crate::logfile::info(format!("reminder #{} ({key}): {what}", self.notifs[i].seq));
             match a {
                 NotifAction::Task(act) => {
-                    self.apply(act);
+                    self.apply_click(act);
                     let r = self.store.set_notif(&key, NotifState { dismissed: true, snooze_until: None });
                     self.report(r);
                     self.notifs[i].closing_at = Some(Instant::now() + Duration::from_secs(1));
@@ -299,6 +309,7 @@ impl TaskerApp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn notification_ui(
         &self,
         ui: &mut Ui,
@@ -306,6 +317,7 @@ impl TaskerApp {
         e: &Entry,
         closing: bool,
         expires_in: Option<Duration>,
+        give_up_wait: u64,
         now: i64,
     ) -> Option<NotifAction> {
         if let NotifKind::Ahead { date, .. } = kind {
@@ -336,10 +348,10 @@ impl TaskerApp {
                 }
             });
             let info = match kind {
-                NotifKind::Due { .. } => {
+                NotifKind::Due { date, .. } => {
                     format!(
                         "Due {} · est. {} · {} priority",
-                        fmt_hm(e.start_min),
+                        due_time(date, e.start_min, Local::now().date_naive()),
                         fmt_duration_min(e.estimate_min),
                         e.priority.label()
                     )
@@ -360,13 +372,21 @@ impl TaskerApp {
                         .color(Color32::WHITE),
                 );
             }
+            // A due reminder has two task buttons, so "12 min overdue" gets its own line
+            // (where the others show the tracked time).
+            let due = matches!(kind, NotifKind::Due { .. });
+            if due {
+                ui.horizontal(|ui| start_offset_labels(ui, e, now, None, true));
+            }
             ui.add_space(2.0);
             ui.add_enabled_ui(!closing, |ui| {
                 ui.horizontal(|ui| {
-                    if let Some(a) = task_buttons(ui, e) {
+                    if let Some(a) = task_buttons(ui, e, give_up_wait) {
                         out = Some(NotifAction::Task(a));
                     }
-                    start_offset_labels(ui, e, now, None, true);
+                    if !due {
+                        start_offset_labels(ui, e, now, None, true);
+                    }
                 });
                 match kind {
                     NotifKind::Due { .. } => {
@@ -446,26 +466,52 @@ impl TaskerApp {
     }
 }
 
+/// Seconds until a due reminder's give-up button can be clicked, for a reminder that
+/// has been open for `open_for`. Rounded up, so the button counts 10, 9, … 1.
+fn give_up_wait_secs(open_for: Duration) -> u64 {
+    Duration::from_secs(GIVE_UP_WAIT_SECS).saturating_sub(open_for).as_secs_f32().ceil() as u64
+}
+
+/// When a task was due, as seen from `today`: "09:00", "yesterday 23:50".
+fn due_time(date: NaiveDate, start_min: u32, today: NaiveDate) -> String {
+    let at = scheduled_at(date, start_min);
+    match (at.date() - today).num_days() {
+        0 => at.format("%H:%M").to_string(),
+        -1 => at.format("yesterday %H:%M").to_string(),
+        _ => at.format("%a %d.%m. %H:%M").to_string(),
+    }
+}
+
 /// Which reminders should be open on `today` at minute-of-day `nm` (timestamp `now`):
 /// - due: a not-yet-started occurrence whose start time has passed (if it has reminders),
 /// - ahead: a not-yet-started occurrence starting within its "notify ahead" time,
 /// - overrun: a running task that has used up its estimate (if it has reminders).
 ///
+/// Midnight is no border for any of them: the occurrences of yesterday and tomorrow
+/// count like today's. A task that was due yesterday and still isn't started keeps its
+/// reminder (and a snoozed one comes back), and a task shortly after midnight is
+/// announced before it.
+///
 /// Dismissed reminders and ones snoozed past `now` are left out.
 fn wanted_reminders(store: &Store, today: NaiveDate, nm: u32, now: i64) -> Vec<NotifKind> {
     let mut wanted: Vec<NotifKind> = Vec::new();
-    for e in store.entries_for(today, now) {
-        if e.status != EntryStatus::Virtual {
-            continue;
-        }
-        if e.notify != NotifyMode::Off && e.start_min <= nm {
-            wanted.push(NotifKind::Due { task_id: e.task_id, date: today });
-        }
-        if e.notify_ahead_min > 0 && nm < e.start_min && nm + e.notify_ahead_min >= e.start_min {
-            wanted.push(NotifKind::Ahead { task_id: e.task_id, date: today });
+    let nm = nm as i64;
+    for date in [today.pred_opt(), Some(today), today.succ_opt()].into_iter().flatten() {
+        for e in store.entries_for(date, now) {
+            if e.status != EntryStatus::Virtual {
+                continue;
+            }
+            // minutes after today's midnight: negative for yesterday, 24 h and more for tomorrow
+            let start = e.start_on(today);
+            if e.notify != NotifyMode::Off && start <= nm {
+                wanted.push(NotifKind::Due { task_id: e.task_id, date });
+            }
+            if e.notify_ahead_min > 0 && nm < start && nm + e.notify_ahead_min as i64 >= start {
+                wanted.push(NotifKind::Ahead { task_id: e.task_id, date });
+            }
         }
     }
-    for r in &store.runs {
+    for r in store.open_runs() {
         if r.status == RunStatus::Running
             && r.notify != NotifyMode::Off
             && r.estimate_min > 0
@@ -562,8 +608,61 @@ mod tests {
         assert_eq!(wanted_reminders(&s, day(), 10 * 60, 5_000), [due], "back after the snooze");
         s.set_notif(&due.key(), NotifState { dismissed: true, snooze_until: None }).unwrap();
         assert!(wanted_reminders(&s, day(), 10 * 60, 9_000).is_empty(), "dismissed");
-        let tomorrow = day().succ_opt().unwrap();
-        assert!(wanted_reminders(&s, tomorrow, 10 * 60, 9_000).is_empty(), "a one-off task isn't due on other days");
+        let next_week = day() + chrono::Duration::days(7);
+        assert!(wanted_reminders(&s, next_week, 10 * 60, 9_000).is_empty(), "a one-off task isn't due a week later");
+    }
+
+    #[test]
+    fn midnight_is_no_border() {
+        let (yesterday, tomorrow) = (day().pred_opt().unwrap(), day().succ_opt().unwrap());
+        // due at 23:50 and not started: still due after midnight, all of the next day
+        let (mut s, id) = store_with(|t| t.start_min = 23 * 60 + 50);
+        let due = NotifKind::Due { task_id: id, date: day() };
+        assert!(wanted_reminders(&s, day(), 23 * 60 + 49, 0).is_empty());
+        assert_eq!(wanted_reminders(&s, day(), 23 * 60 + 50, 0), [due]);
+        assert_eq!(wanted_reminders(&s, tomorrow, 0, 0), [due], "it is the same reminder as before midnight");
+        assert_eq!(wanted_reminders(&s, tomorrow, 23 * 60 + 59, 0), [due]);
+        assert!(wanted_reminders(&s, tomorrow.succ_opt().unwrap(), 0, 0).is_empty(), "not for ever");
+        // a snooze that ends after midnight comes back
+        s.set_notif(&due.key(), NotifState { dismissed: false, snooze_until: Some(5_000) }).unwrap();
+        assert!(wanted_reminders(&s, tomorrow, 5, 4_999).is_empty());
+        assert_eq!(wanted_reminders(&s, tomorrow, 5, 5_000), [due]);
+        // giving it up (or starting it) on the next day ends it
+        s.fail(id, day(), 6_000).unwrap();
+        assert!(wanted_reminders(&s, tomorrow, 5, 6_000).is_empty());
+
+        // a task shortly after midnight is announced before midnight
+        let (s, id) = store_with(|t| {
+            t.start_min = 5;
+            t.notify_ahead_min = 10;
+        });
+        let ahead = NotifKind::Ahead { task_id: id, date: day() };
+        assert!(wanted_reminders(&s, yesterday, 23 * 60 + 54, 0).is_empty());
+        assert_eq!(wanted_reminders(&s, yesterday, 23 * 60 + 55, 0), [ahead]);
+        assert_eq!(wanted_reminders(&s, day(), 4, 0), [ahead]);
+        assert_eq!(wanted_reminders(&s, day(), 5, 0), [NotifKind::Due { task_id: id, date: day() }]);
+
+        // a daily task missed yesterday: yesterday's reminder stays next to today's
+        let (s, id) = store_with(|t| {
+            t.schedule = Schedule::Weekdays { mask: 0b111_1111, from: yesterday, every: WeekRepeat::Weekly }
+        });
+        let due = |date| NotifKind::Due { task_id: id, date };
+        assert_eq!(wanted_reminders(&s, day(), 8 * 60, 0), [due(yesterday)]);
+        assert_eq!(wanted_reminders(&s, day(), 9 * 60, 0), [due(yesterday), due(day())]);
+    }
+
+    #[test]
+    fn give_up_button_waits_ten_seconds() {
+        let wait = |ms| give_up_wait_secs(Duration::from_millis(ms));
+        assert_eq!(wait(0), 10);
+        assert_eq!(wait(1), 10, "counts 10, 9, … 1");
+        assert_eq!(wait(1_000), 9);
+        assert_eq!(wait(9_001), 1);
+        assert_eq!(wait(10_000), 0, "clickable");
+        assert_eq!(wait(60_000), 0);
+        assert_eq!(due_time(day(), 9 * 60, day()), "09:00");
+        assert_eq!(due_time(day().pred_opt().unwrap(), 23 * 60 + 50, day()), "yesterday 23:50");
+        assert_eq!(due_time(NaiveDate::from_ymd_opt(2026, 11, 3).unwrap(), 9 * 60, day()), "Tue 03.11. 09:00");
     }
 
     #[test]

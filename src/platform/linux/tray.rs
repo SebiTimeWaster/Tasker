@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
-use crate::tray::{self as model, MenuEntry, RunningTask, UiMsg};
+use crate::tray::{self as model, MenuEntry, TrayTask, UiMsg};
 
 struct TaskerTray {
     tx: Sender<UiMsg>,
     ctx: egui::Context,
-    running: Vec<RunningTask>,
+    running: Vec<TrayTask>,
     /// Whether a panel/tray host is currently showing our icon.
     online: Arc<AtomicBool>,
 }
@@ -101,7 +101,7 @@ impl Tray {
     }
 
     /// Update icon color, tooltip and menu.
-    pub fn set_running(&self, running: Vec<RunningTask>) {
+    pub fn set_tasks(&self, running: Vec<TrayTask>) {
         self.0.update(|t| t.running = running);
     }
 }
@@ -116,7 +116,12 @@ mod tests {
         let t = TaskerTray {
             tx: std::sync::mpsc::channel().0,
             ctx: egui::Context::default(),
-            running: vec![RunningTask { run_id: 1, title: "Busy_work".into(), paused: false }],
+            running: vec![TrayTask {
+                run_id: 1,
+                title: "Busy_work".into(),
+                state: crate::tray::TrayState::Running,
+                undo: false,
+            }],
             online: Arc::new(AtomicBool::new(true)),
         };
         let labels: Vec<String> = t
