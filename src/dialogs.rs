@@ -3,8 +3,9 @@
 use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Local, NaiveDate, Timelike};
-use egui::{Align2, Color32, FontId, Id, Modal, Rect, Response, RichText, Sense, Stroke, TextStyle, Ui};
+use egui::{Align2, Color32, FontId, Id, Modal, Rect, RichText, Sense, Stroke, TextStyle, Ui};
 
+use crate::app::GRID_LINE;
 use crate::audio::Audio;
 use crate::model::*;
 use crate::platform;
@@ -12,8 +13,8 @@ use crate::settings::{Corner, DEFAULT_SNOOZE, Settings, SoundChoice, UI_SCALE_PC
 use crate::store::Store;
 use crate::views::{month_grid, month_header};
 use crate::widgets::{
-    ACTION_PAD, ACTION_PAD_SYM, ACTION_TEXT, Act, FAILED_RED, HEADLINE, action_button, action_height, choice_button,
-    choice_button_ext, preset_button, preset_row,
+    ACTION_PAD, ACTION_PAD_SYM, ACTION_TEXT, Act, FAILED_RED, HEADLINE, RADIO_GAP, action_button, action_height,
+    choice_button_ext, preset_button, preset_row, radio, radio_row,
 };
 
 /// Dragging a number field changes it by one step per this many points of mouse travel.
@@ -201,19 +202,10 @@ fn two_digit(v: f64, _: std::ops::RangeInclusive<usize>) -> String {
 const CTRL_SIZE: f32 = ACTION_TEXT;
 /// Inner padding of the controls (the same for buttons and text fields).
 const CTRL_PAD: egui::Margin = ACTION_PAD;
-/// Width of the row labels on the left of each column.
-const LABEL_W: f32 = 100.0;
-/// Space between two rows of the editor.
-const ROW_GAP: f32 = 14.0;
 
 /// Height of one control: a line of control text plus the padding.
 fn ctrl_h(ui: &Ui) -> f32 {
     action_height(ui)
-}
-
-/// A choice button with the control font.
-fn sel(ui: &mut Ui, on: bool, text: impl Into<String>) -> Response {
-    choice_button(ui, on, text)
 }
 
 /// A line of preset buttons below a field.
@@ -252,35 +244,44 @@ const CAL_W: f32 = 380.0;
 const DAY_GAP: f32 = 4.0;
 /// Width of one day button, so a row of 7 is exactly as wide as the calendar.
 const DAY_BTN_W: f32 = (CAL_W - 6.0 * DAY_GAP) / 7.0;
-const LEFT_FIELD_W: f32 = 540.0;
+/// Width of the text fields in the editor's left column.
+const LEFT_FIELD_W: f32 = 440.0;
 
-/// One row of the editor: the label on the left, vertically centered on the row's first
-/// control (not on the whole row, so it stays next to the field it names when presets
-/// or a calendar follow below), and the contents on the right.
-fn row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
-    ui.horizontal_top(|ui| {
-        let size = egui::vec2(LABEL_W, ctrl_h(ui));
-        ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_min_size(size);
-            ui.label(RichText::new(label).color(Color32::from_gray(170)));
-        });
-        ui.vertical(add);
-    });
-    ui.add_space(ROW_GAP);
+/// The frame of the dialogs: a popup with 15 px between its border and the content.
+fn dialog_frame(ctx: &egui::Context) -> egui::Frame {
+    egui::Frame::popup(&ctx.global_style()).inner_margin(15)
 }
 
-/// A row of the settings dialog: label left, aligned with the row's first line.
-fn settings_row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
-    ui.horizontal_top(|ui| {
-        let line_h = ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y;
-        let size = egui::vec2(150.0, line_h.max(ui.spacing().interact_size.y));
-        ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_min_size(size);
-            ui.label(label);
-        });
-        ui.vertical(add);
-    });
-    ui.add_space(12.0);
+/// Space between the sections of a dialog.
+const SECTION_GAP: f32 = 15.0;
+/// Space between a section's title and its controls.
+const SECTION_TITLE_GAP: f32 = 10.0;
+
+/// The sections of a dialog (or of a column of one): each one's title above its controls,
+/// followed by a divider to the right edge.
+#[derive(Default)]
+struct Sections {
+    /// The titles; their dividers are drawn once the width of the dialog is known (`finish`).
+    titles: Vec<Rect>,
+}
+
+impl Sections {
+    fn add(&mut self, ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
+        if !self.titles.is_empty() {
+            ui.add_space(SECTION_GAP - ui.spacing().item_spacing.y);
+        }
+        self.titles.push(ui.label(label).rect);
+        ui.add_space(SECTION_TITLE_GAP - ui.spacing().item_spacing.y);
+        ui.scope(add);
+    }
+
+    fn finish(self, ui: &mut Ui) {
+        let right = ui.min_rect().right();
+        let gap = ui.spacing().item_spacing.x;
+        for t in self.titles {
+            ui.painter().hline(t.right() + gap..=right, t.center().y.round() + 0.5, Stroke::new(1.0, GRID_LINE));
+        }
+    }
 }
 
 /// A number field with the control font.
@@ -289,8 +290,9 @@ fn number<'a>(v: &'a mut u32, max: u32, steps_per_point: f64) -> egui::DragValue
 }
 
 fn details_column(ui: &mut Ui, ed: &mut Editor) {
-    let field_w = LEFT_FIELD_W - LABEL_W;
-    row(ui, "Title", |ui| {
+    let field_w = LEFT_FIELD_W;
+    let mut sec = Sections::default();
+    sec.add(ui, "Title", |ui| {
         let r = ui.add(
             egui::TextEdit::singleline(&mut ed.title)
                 .desired_width(field_w)
@@ -303,11 +305,11 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
         }
     });
 
-    row(ui, "Notes", |ui| {
+    sec.add(ui, "Notes", |ui| {
         ui.add(egui::TextEdit::multiline(&mut ed.notes).desired_rows(3).desired_width(field_w).margin(CTRL_PAD));
     });
 
-    row(ui, "Start time", |ui| {
+    sec.add(ui, "Start time", |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.add(number(&mut ed.start_h, 23, 1.0).custom_formatter(two_digit));
@@ -324,7 +326,7 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
         });
     });
 
-    row(ui, "Estimate", |ui| {
+    sec.add(ui, "Estimate", |ui| {
         ui.horizontal(|ui| {
             ui.add(number(&mut ed.est_h, 23, 1.0).suffix(" h"));
             ui.add(number(&mut ed.est_m, 59, 0.5).suffix(" min"));
@@ -339,27 +341,27 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
         });
     });
 
-    row(ui, "Priority", |ui| {
-        ui.horizontal_wrapped(|ui| {
+    sec.add(ui, "Priority", |ui| {
+        radio_row(ui, |ui| {
             for p in Priority::ALL {
-                if choice_button_ext(ui, ed.priority == p, p.label(), p.color(), egui::Vec2::ZERO).clicked() {
+                if radio(ui, ed.priority == p, RichText::new(p.label()).color(p.color())).clicked() {
                     ed.priority = p;
                 }
             }
         });
     });
 
-    row(ui, "Reminder", |ui| {
-        ui.horizontal_wrapped(|ui| {
+    sec.add(ui, "Reminder", |ui| {
+        radio_row(ui, |ui| {
             for n in NotifyMode::ALL {
-                if sel(ui, ed.notify == n, format!("{} {}", n.icon(), n.label())).clicked() {
+                if radio(ui, ed.notify == n, format!("{} {}", n.icon(), n.label())).clicked() {
                     ed.notify = n;
                 }
             }
         });
     });
 
-    row(ui, "Notify ahead", |ui| {
+    sec.add(ui, "Notify ahead", |ui| {
         ui.horizontal(|ui| {
             ui.add(
                 number(&mut ed.notify_ahead, 240, 1.0)
@@ -383,6 +385,7 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
             }
         });
     });
+    sec.finish(ui);
 }
 
 fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
@@ -392,10 +395,11 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
         ed.last_from = eff;
         ed.from_month = first_of_month(eff);
     }
-    row(ui, "Active on", |ui| {
-        ui.horizontal(|ui| {
+    let mut sec = Sections::default();
+    sec.add(ui, "Active on", |ui| {
+        radio_row(ui, |ui| {
             for (m, label) in [(Mode::Date, "Date"), (Mode::Weekdays, "Weekdays"), (Mode::MonthDays, "Month days")] {
-                if sel(ui, ed.mode == m, label).clicked() {
+                if radio(ui, ed.mode == m, label).clicked() {
                     ed.mode = m;
                 }
             }
@@ -404,11 +408,11 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
 
     match ed.mode {
         Mode::Date => {
-            row(ui, "Date", |ui| calendar(ui, "date-cal", &mut ed.date_month, &mut ed.date, None));
-            row(ui, "Repeat", |ui| {
-                ui.horizontal(|ui| {
+            sec.add(ui, "Date", |ui| calendar(ui, "date-cal", &mut ed.date_month, &mut ed.date, None));
+            sec.add(ui, "Repeat", |ui| {
+                radio_row(ui, |ui| {
                     for r in Repeat::CHOICES {
-                        if sel(ui, ed.repeat == r, r.label()).clicked() {
+                        if radio(ui, ed.repeat == r, r.label()).clicked() {
                             ed.repeat = r;
                         }
                     }
@@ -416,7 +420,7 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
             });
         }
         Mode::Weekdays => {
-            row(ui, "Days", |ui| {
+            sec.add(ui, "Days", |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = DAY_GAP;
                     ui.spacing_mut().button_padding.x = 2.0;
@@ -441,7 +445,7 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
             });
         }
         Mode::MonthDays => {
-            row(ui, "Days", |ui| {
+            sec.add(ui, "Days", |ui| {
                 let h = ctrl_h(ui);
                 egui::Grid::new("md-grid").spacing([DAY_GAP, DAY_GAP]).show(ui, |ui| {
                     ui.spacing_mut().button_padding.x = 2.0;
@@ -471,7 +475,7 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
     }
 
     if ed.mode != Mode::Date {
-        row(ui, "Starting", |ui| {
+        sec.add(ui, "Starting", |ui| {
             let mut shown = eff;
             let mut month = ed.from_month;
             let check = |d: NaiveDate| ed.can_start_on(d);
@@ -487,13 +491,10 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
     match ed.mode {
         Mode::Date => {}
         Mode::Weekdays => {
-            row(ui, "Repeat", |ui| {
-                egui::Grid::new("wd-every").spacing([DAY_GAP, DAY_GAP]).show(ui, |ui| {
+            sec.add(ui, "Repeat", |ui| {
+                egui::Grid::new("wd-every").spacing([RADIO_GAP, ui.spacing().item_spacing.y]).show(ui, |ui| {
                     for (i, r) in WeekRepeat::ALL.into_iter().enumerate() {
-                        let w = (CAL_W - DAY_GAP) / 2.0;
-                        if choice_button_ext(ui, ed.wd_every == r, r.label(), Color32::WHITE, egui::vec2(w, 0.0))
-                            .clicked()
-                        {
+                        if radio(ui, ed.wd_every == r, r.label()).clicked() {
                             ed.wd_every = r;
                         }
                         if i % 2 == 1 {
@@ -507,12 +508,12 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
             });
         }
         Mode::MonthDays => {
-            row(ui, "Repeat", |ui| {
-                ui.add_space(CTRL_PAD.top as f32);
+            sec.add(ui, "Repeat", |ui| {
                 ui.label(RichText::new("Every month. Months without a selected day skip it.").weak());
             });
         }
     }
+    sec.finish(ui);
 }
 
 pub fn editor_ui(ctx: &egui::Context, ed: &mut Editor) -> EditorResult {
@@ -520,7 +521,7 @@ pub fn editor_ui(ctx: &egui::Context, ed: &mut Editor) -> EditorResult {
     // Anchored at the top so a taller schedule only extends the dialog downwards.
     let top = ((ctx.content_rect().height() - 700.0) / 2.0).max(10.0);
     let area = Modal::default_area(Id::unique("task-editor")).anchor(Align2::CENTER_TOP, egui::vec2(0.0, top));
-    let modal = Modal::new(Id::unique("task-editor")).area(area).show(ctx, |ui| {
+    let modal = Modal::new(Id::unique("task-editor")).area(area).frame(dialog_frame(ctx)).show(ctx, |ui| {
         ui.heading(if ed.task_id.is_some() { "Edit task" } else { "New task" });
         if ed.task_id.is_some() {
             ui.label(
@@ -546,12 +547,12 @@ pub fn editor_ui(ctx: &egui::Context, ed: &mut Editor) -> EditorResult {
             left.right() + 14.0
         });
         let r = cols.response.rect;
-        ui.painter().vline(cols.inner, r.y_range(), ui.visuals().widgets.noninteractive.bg_stroke);
+        ui.painter().vline(cols.inner, r.y_range(), Stroke::new(1.0, GRID_LINE));
 
         if let Some(err) = &ed.error {
             ui.colored_label(Color32::from_rgb(240, 110, 100), err);
         }
-        ui.add_space(8.0);
+        ui.add_space(SECTION_GAP - ui.spacing().item_spacing.y);
         ui.separator();
         ui.horizontal(|ui| {
             let save = action_button(ui, "Save", Act::Primary, true).on_hover_text("Ctrl+Enter");
@@ -697,7 +698,7 @@ pub fn task_list_ui(ctx: &egui::Context, store: &Store) -> ListResult {
         });
         ui.add_space(2.0);
     };
-    let modal = Modal::new(Id::unique("task-list")).show(ctx, |ui| {
+    let modal = Modal::new(Id::unique("task-list")).frame(dialog_frame(ctx)).show(ctx, |ui| {
         ui.set_width(640.0_f32.min(screen.x - 60.0).max(200.0));
         ui.horizontal(|ui| {
             ui.heading("☰ Tasks");
@@ -762,7 +763,7 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
     let now = Local::now();
     let pts = stats_points(store, task, now.date_naive(), now.timestamp());
     let mut open = true;
-    let modal = Modal::new(Id::unique("stats")).show(ctx, |ui| {
+    let modal = Modal::new(Id::unique("stats")).frame(dialog_frame(ctx)).show(ctx, |ui| {
         ui.set_width(680.0);
         ui.horizontal(|ui| {
             ui.heading(format!("📊 {}", task.title));
@@ -998,32 +999,33 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
     // At large UI scales the dialog may not fit the window: scroll the settings, keep
     // Save / Cancel visible.
     let screen = ctx.content_rect().size();
-    let modal = Modal::new(Id::unique("settings")).show(ctx, |ui| {
+    let modal = Modal::new(Id::unique("settings")).frame(dialog_frame(ctx)).show(ctx, |ui| {
         ui.heading("⚙ Settings");
         ui.add_space(6.0);
         // As wide as the content needs; only the height is limited (vertical scrolling).
         egui::ScrollArea::vertical().max_height((screen.y - 150.0).max(80.0)).show(ui, |ui| {
             ui.vertical(|ui| {
-                settings_row(ui, "Notification corner", |ui| {
-                egui::Grid::new("corner").spacing([4.0, 4.0]).show(ui, |ui| {
-                    if choice_button_ext(ui, s.corner == Corner::TopLeft, "↖ Top left", Color32::WHITE, egui::vec2(150.0, 0.0)).clicked() {
-                        s.corner = Corner::TopLeft;
-                    }
-                    if choice_button_ext(ui, s.corner == Corner::TopRight, "↗ Top right", Color32::WHITE, egui::vec2(150.0, 0.0)).clicked() {
-                        s.corner = Corner::TopRight;
-                    }
-                    ui.end_row();
-                    if choice_button_ext(ui, s.corner == Corner::BottomLeft, "↙ Bottom left", Color32::WHITE, egui::vec2(150.0, 0.0)).clicked() {
-                        s.corner = Corner::BottomLeft;
-                    }
-                    if choice_button_ext(ui, s.corner == Corner::BottomRight, "↘ Bottom right", Color32::WHITE, egui::vec2(150.0, 0.0)).clicked() {
-                        s.corner = Corner::BottomRight;
-                    }
-                    ui.end_row();
-                });
+                let mut sections = Sections::default();
+                sections.add(ui, "Notification corner", |ui| {
+                    let corners = [
+                        (Corner::TopLeft, "↖ Top left"),
+                        (Corner::TopRight, "↗ Top right"),
+                        (Corner::BottomLeft, "↙ Bottom left"),
+                        (Corner::BottomRight, "↘ Bottom right"),
+                    ];
+                    egui::Grid::new("corner").spacing([RADIO_GAP, ui.spacing().item_spacing.y]).show(ui, |ui| {
+                        for (i, (c, label)) in corners.into_iter().enumerate() {
+                            if radio(ui, s.corner == c, label).clicked() {
+                                s.corner = c;
+                            }
+                            if i % 2 == 1 {
+                                ui.end_row();
+                            }
+                        }
+                    });
                 });
 
-                settings_row(ui, "Snooze options", |ui| {
+                sections.add(ui, "Snooze options", |ui| {
                     preset_row(ui, |ui| {
                         let mut remove = None;
                         for (i, m) in s.snooze_minutes.iter().enumerate() {
@@ -1052,7 +1054,7 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     });
                 });
 
-                settings_row(ui, "Sound", |ui| {
+                sections.add(ui, "Sound", |ui| {
                     egui::ComboBox::from_id_salt("sound").selected_text(s.sound.label()).width(200.0).show_ui(ui, |ui| {
                         for c in SoundChoice::ALL {
                             ui.selectable_value(&mut s.sound, c, c.label());
@@ -1078,7 +1080,7 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     }
                 });
 
-                settings_row(ui, "Volume ramp", |ui| {
+                sections.add(ui, "Volume ramp", |ui| {
                     ui.add(egui::Slider::new(&mut s.start_volume, 0.0..=1.0).text("start volume").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
                     ui.add(egui::Slider::new(&mut s.end_volume, 0.0..=1.0).text("end volume").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
                     ui.add(egui::Slider::new(&mut s.ramp_secs, 0.0..=300.0).text("ramp time").suffix(" s"));
@@ -1095,7 +1097,7 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     }
                 });
 
-                settings_row(ui, "UI scale", |ui| {
+                sections.add(ui, "UI scale", |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().slider_width = 230.0;
                         let slider = egui::Slider::new(&mut dlg.scale_pct, UI_SCALE_PCT).suffix(" %").logarithmic(true);
@@ -1120,13 +1122,14 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     );
                 });
 
-                settings_row(ui, "Window", |ui| {
+                sections.add(ui, "Window", |ui| {
                     ui.checkbox(&mut s.close_to_tray, "Close button minimizes to the panel instead of quitting");
                     ui.checkbox(&mut s.start_minimized, "Start minimized to the panel (or start with --minimized)");
                 });
+                sections.finish(ui);
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(SECTION_GAP - ui.spacing().item_spacing.y);
         ui.separator();
         ui.horizontal(|ui| {
             if action_button(ui, "Save", Act::Primary, true).clicked() {

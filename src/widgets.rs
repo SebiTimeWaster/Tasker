@@ -25,13 +25,16 @@ pub const TEXT: f32 = 16.0;
 // ---------------------------------------------------------------------------- buttons
 //
 // Tasker has two kinds of buttons, each with one look everywhere:
-// - action buttons do something (Start, Pause, Save, Cancel, Dismiss, ✏, …) or pick one
-//   of several options (priority, corner, …): rectangular, white text, the main action
-//   of a group filled with a color ([`action_button`]), a chosen option highlighted
-//   ([`choice_button`]), icon-only ones the same ([`icon_button`]);
+// - action buttons do something (Start, Pause, Save, Cancel, Dismiss, ✏, …) or switch
+//   something on and off (the days of a schedule): rectangular, white text, the main
+//   action of a group filled with a color ([`action_button`]), a switched-on one
+//   highlighted ([`choice_button_ext`]), icon-only ones the same ([`icon_button`]);
 // - preset buttons fill in or apply a ready-made value (time and duration presets,
 //   snooze times, "+10 min"): smaller rounded pills, highlighted while their value is the
 //   current one ([`preset_button`]).
+//
+// One of several options (priority, repeat, corner, …) is picked with radio buttons
+// ([`radio`], in a [`radio_row`]).
 //
 // They are drawn here rather than with `egui::Button`, whose padding is the same above
 // and below the text: text needs a bit more room below it to look centered.
@@ -137,12 +140,8 @@ pub fn icon_button(ui: &mut Ui, icon: &str) -> egui::Response {
     paint_button(ui, text, Look { pad: ACTION_PAD, radius: 4, fill: None, selected: None, enabled: true, min_size })
 }
 
-/// An action button for one of several options; `on`: this option is the chosen one.
-pub fn choice_button(ui: &mut Ui, on: bool, text: impl Into<String>) -> egui::Response {
-    choice_button_ext(ui, on, text, Color32::WHITE, egui::Vec2::ZERO)
-}
-
-/// [`choice_button`] with a text color (while not chosen) and a minimum size.
+/// An action button that is switched on or off (`on`), with a text color (while off) and
+/// a minimum size.
 pub fn choice_button_ext(
     ui: &mut Ui,
     on: bool,
@@ -153,6 +152,24 @@ pub fn choice_button_ext(
     let text = RichText::new(text).size(ACTION_TEXT).color(if on { Color32::WHITE } else { color });
     paint_button(ui, text, Look { pad: ACTION_PAD, radius: 4, fill: None, selected: Some(on), enabled: true, min_size })
 }
+
+/// A radio button for one of several options; `on`: it is the chosen one. Its text is
+/// clickable too.
+pub fn radio(ui: &mut Ui, on: bool, text: impl Into<RichText>) -> egui::Response {
+    ui.add(egui::RadioButton::new(on, text.into().size(ACTION_TEXT)))
+}
+
+/// A row of radio buttons with room between the options.
+pub fn radio_row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = RADIO_GAP;
+        add(ui)
+    })
+    .inner
+}
+
+/// Space between the options of a [`radio_row`] (and between the columns of a grid of them).
+pub const RADIO_GAP: f32 = 18.0;
 
 /// A preset button (see above); `on`: its value is the current one.
 pub fn preset_button(ui: &mut Ui, on: bool, text: impl Into<String>) -> egui::Response {
