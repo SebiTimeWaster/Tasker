@@ -92,6 +92,11 @@ impl Screen {
         list.into_iter().map(|(_, a)| a).collect()
     }
 
+    /// The monitors' work areas, for the log.
+    pub fn describe(&self) -> String {
+        format!("monitor work areas {:?} (primary first)", self.monitor_areas())
+    }
+
     /// Reminder windows are created without a taskbar entry (`with_taskbar(false)`),
     /// which Windows honors directly.
     pub fn hide_from_taskbar(&self, _title: &str) -> bool {

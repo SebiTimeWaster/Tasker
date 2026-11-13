@@ -15,7 +15,10 @@ use crate::action::Action;
 use crate::app::{GRID_LINE, TaskerApp, now_min, now_ts, snoozed_until, today};
 use crate::dialogs::Editor;
 use crate::model::*;
-use crate::widgets::{FAILED_RED, start_offset_labels, task_button, task_buttons};
+use crate::widgets::{
+    ACTION_TEXT, Act, FAILED_RED, HEADLINE, PRIMARY_BLUE, TEXT, action_button, action_height, icon_button,
+    preset_button, preset_row, start_offset_labels, task_buttons,
+};
 
 const ACCENT: Color32 = Color32::from_rgb(90, 140, 210);
 
@@ -48,9 +51,9 @@ pub fn left_column(app: &mut TaskerApp, ui: &mut Ui) {
     let btn_rect = Rect::from_min_max(egui::pos2(avail.min.x, avail.max.y - btn_h), avail.max);
     week_list(app, ui, week_rect);
 
-    let btn = egui::Button::new(RichText::new("+  Add task").size(16.0).strong().color(Color32::WHITE))
-        .fill(Color32::from_rgb(52, 92, 160))
-        .corner_radius(6);
+    let btn = egui::Button::new(RichText::new("+  Add task").size(ACTION_TEXT).strong().color(Color32::WHITE))
+        .fill(PRIMARY_BLUE)
+        .corner_radius(4);
     if ui.place(btn_rect, btn).clicked() {
         app.editor = Some(Editor::new(app.selected));
     }
@@ -59,19 +62,19 @@ pub fn left_column(app: &mut TaskerApp, ui: &mut Ui) {
 /// "◀ November 2026 ▶  [Today]". Returns true if changed.
 pub fn month_header(ui: &mut Ui, month: &mut NaiveDate, selected: &mut NaiveDate, today_button: bool) {
     ui.horizontal(|ui| {
-        if ui.button("◀").clicked() {
+        if action_button(ui, "◀", Act::Plain, true).clicked() {
             *month = add_months(*month, -1);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if today_button && ui.button("Today").clicked() {
+            if today_button && action_button(ui, "Today", Act::Plain, true).clicked() {
                 *selected = today();
                 *month = first_of_month(*selected);
             }
-            if ui.button("▶").clicked() {
+            if action_button(ui, "▶", Act::Plain, true).clicked() {
                 *month = add_months(*month, 1);
             }
             let title = month.format("%B %Y").to_string();
-            ui.add_sized([ui.available_width(), 22.0], egui::Label::new(RichText::new(title).size(16.0).strong()));
+            ui.add_sized([ui.available_width(), 26.0], egui::Label::new(RichText::new(title).size(HEADLINE).strong()));
         });
     });
 }
@@ -89,11 +92,11 @@ pub fn month_grid(
 ) {
     let width = ui.available_width();
     let cell_w = width / 7.0;
-    let (head, _) = ui.allocate_exact_size(egui::vec2(width, 18.0), Sense::hover());
+    let (head, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), Sense::hover());
     for (i, name) in WEEKDAY_SHORT.iter().enumerate() {
         let c = egui::pos2(head.left() + cell_w * (i as f32 + 0.5), head.center().y);
         let col = if i >= 5 { Color32::from_gray(140) } else { Color32::from_gray(170) };
-        ui.painter().text(c, Align2::CENTER_CENTER, &name[..2], FontId::proportional(11.0), col);
+        ui.painter().text(c, Align2::CENTER_CENTER, &name[..2], FontId::proportional(TEXT), col);
     }
     let (grid, _) = ui.allocate_exact_size(egui::vec2(width, cell_h * 6.0), Sense::hover());
     let start = monday_of(month);
@@ -126,7 +129,7 @@ pub fn month_grid(
         };
         let has_counts = counts.is_some();
         let num_y = if has_counts { r.center().y - 4.0 } else { r.center().y };
-        let font = FontId::proportional((cell_h * 0.4).clamp(13.0, 16.0));
+        let font = FontId::proportional(TEXT);
         p.text(egui::pos2(r.center().x, num_y), Align2::CENTER_CENTER, d.day().to_string(), font, color);
         if let Some(counts) = counts {
             let n = counts(d);
@@ -175,6 +178,12 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
     let today = today();
     let p = ui.painter().clone();
     p.hline(rect.x_range(), rect.top(), Stroke::new(1.0, GRID_LINE));
+    let big = HEADLINE;
+    // The dates form a column right of the longest weekday name.
+    let name_w = WEEKDAY_LONG
+        .iter()
+        .map(|n| ui.fonts_mut(|f| f.layout_no_wrap(n.to_string(), FontId::proportional(big), Color32::WHITE).size().x))
+        .fold(0.0, f32::max);
     for i in 0..7 {
         let d = monday + Duration::days(i);
         let r = Rect::from_min_size(
@@ -189,7 +198,6 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
         }
         let entries = app.store.entries_shown_on(d, now);
         let name_col = if d == today { Color32::from_rgb(240, 200, 90) } else { Color32::from_gray(230) };
-        let big = (row_h * 0.3).clamp(13.0, 18.0);
         let x = r.left() + 8.0;
         p.text(
             egui::pos2(x, r.top() + 6.0),
@@ -199,21 +207,24 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
             name_col,
         );
         p.text(
-            egui::pos2(x + 100.0, r.top() + 6.0 + big * 0.15),
+            // on the name's baseline
+            egui::pos2(x + name_w + 10.0, r.top() + 6.0 + (big - TEXT) * 0.8),
             Align2::LEFT_TOP,
             d.format("%d.%m.").to_string(),
-            FontId::proportional(big * 0.8),
+            FontId::proportional(TEXT),
             Color32::from_gray(140),
         );
         let total = entries.len();
         let done = entries.iter().filter(|e| e.status == EntryStatus::Done).count();
         let failed = entries.iter().filter(|e| e.status == EntryStatus::Failed).count();
         let (green, red) = (Color32::from_rgb(110, 170, 120), Color32::from_rgb(215, 95, 85));
+        // On the line of the day's name (not the row's center, which is lower than the
+        // name in rows without a second line).
         p.text(
-            egui::pos2(r.right() - 10.0, r.center().y),
+            egui::pos2(r.right() - 10.0, r.top() + 6.0 + big * 0.6),
             Align2::RIGHT_CENTER,
             total.to_string(),
-            FontId::proportional((row_h * 0.45).clamp(16.0, 28.0)),
+            FontId::proportional((row_h * 0.38).clamp(16.0, 24.0)),
             if total == 0 {
                 Color32::from_gray(90)
             } else if done == total {
@@ -226,9 +237,9 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
         );
         if let Some(e) = next_task(&entries, d) {
             let txt = format!("{}  {}", fmt_hm(e.start_min), e.title);
-            let g = elided(ui, &txt, FontId::proportional(12.0), Color32::from_gray(160), r.width() - 60.0);
+            let g = elided(ui, &txt, FontId::proportional(TEXT), Color32::from_gray(160), r.width() - 60.0);
             let y = r.top() + 8.0 + big + 4.0;
-            if y + 12.0 < r.bottom() {
+            if y + TEXT < r.bottom() {
                 p.circle_filled(egui::pos2(x + 3.0, y + 7.0), 3.0, e.priority.color());
                 p.galley(egui::pos2(x + 11.0, y), g, Color32::from_gray(160));
             }
@@ -236,7 +247,7 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
             let y = r.top() + 8.0 + big + 4.0;
             let (text, color) =
                 if failed == 0 { ("all done ✔".to_string(), green) } else { (format!("{failed} failed ✖"), red) };
-            p.text(egui::pos2(x, y), Align2::LEFT_TOP, text, FontId::proportional(12.0), color);
+            p.text(egui::pos2(x, y), Align2::LEFT_TOP, text, FontId::proportional(TEXT), color);
         }
         p.hline(rect.x_range(), r.bottom(), Stroke::new(1.0, GRID_LINE));
         if resp.clicked() {
@@ -273,7 +284,7 @@ pub fn day_view(app: &mut TaskerApp, ui: &mut Ui) {
         egui::pos2(header.left() + 14.0, header.center().y),
         Align2::LEFT_CENTER,
         app.selected.format("%A, %d %B %Y").to_string(),
-        FontId::proportional(18.0),
+        FontId::proportional(HEADLINE),
         Color32::WHITE,
     );
     let done = entries.iter().filter(|e| e.status == EntryStatus::Done).count();
@@ -290,7 +301,7 @@ pub fn day_view(app: &mut TaskerApp, ui: &mut Ui) {
         format!("{short} · planned {} · tracked {}", fmt_duration_min(est), fmt_duration_min((tracked / 60) as u32));
     // drop the details when the window is too narrow for them
     let room = header.right() - 14.0 - (title.right() + 20.0);
-    let layout = |t: String| ui.fonts_mut(|f| f.layout_no_wrap(t, FontId::proportional(13.0), Color32::from_gray(160)));
+    let layout = |t: String| ui.fonts_mut(|f| f.layout_no_wrap(t, FontId::proportional(TEXT), Color32::from_gray(160)));
     let summary = Some(layout(long))
         .filter(|g| g.size().x <= room)
         .or_else(|| Some(layout(short)).filter(|g| g.size().x <= room));
@@ -315,7 +326,7 @@ pub fn day_view(app: &mut TaskerApp, ui: &mut Ui) {
             if entries.is_empty() {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("No tasks on this day").size(16.0).color(Color32::from_gray(140)));
+                    ui.label(RichText::new("No tasks on this day").size(TEXT).color(Color32::from_gray(140)));
                     ui.label(RichText::new("Use “+ Add task” to plan something.").color(Color32::from_gray(110)));
                 });
             }
@@ -454,7 +465,7 @@ fn status_chip(ui: &mut Ui, text: &str, color: Color32) {
         .corner_radius(8)
         .inner_margin(Margin::symmetric(6, 1))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.0).color(color));
+            ui.label(RichText::new(text).size(TEXT).color(color));
         });
 }
 
@@ -480,9 +491,10 @@ fn task_row(
             ui.multiply_opacity(if failed { 0.8 } else { 0.5 });
         }
         ui.spacing_mut().item_spacing.y = 5.0;
-        // title line
+        // title line, as high as its ✏ button whether that is shown or not
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&e.title).size(16.0).strong().color(Color32::WHITE));
+            ui.set_min_height(action_height(ui));
+            ui.label(RichText::new(&e.title).size(HEADLINE).strong().color(Color32::WHITE));
             match e.status {
                 EntryStatus::Virtual => status_chip(ui, "planned", Color32::from_gray(160)),
                 EntryStatus::Running => status_chip(ui, "running", Color32::from_rgb(110, 200, 130)),
@@ -501,10 +513,10 @@ fn task_row(
                     } else {
                         "Edit task"
                     };
-                    if ui.add(egui::Button::new("✏").frame(false)).on_hover_text(tip).clicked() {
+                    if icon_button(ui, "✏").on_hover_text(tip).clicked() {
                         action = Some(Action::Edit(e.task_id));
                     }
-                    if e.recurring && ui.add(egui::Button::new("📊 Statistics").small()).clicked() {
+                    if e.recurring && action_button(ui, "📊 Statistics", Act::Plain, true).clicked() {
                         action = Some(Action::Stats(e.task_id));
                     }
                 }
@@ -529,9 +541,9 @@ fn task_row(
         if !e.schedule_desc.is_empty() && e.recurring {
             meta.push_str(&format!("   ·   {}", e.schedule_desc));
         }
-        ui.label(RichText::new(meta).size(12.5).color(Color32::from_gray(170)));
+        ui.label(RichText::new(meta).size(TEXT).color(Color32::from_gray(170)));
         if !e.notes.trim().is_empty() {
-            ui.label(RichText::new(e.notes.trim()).size(13.0).color(Color32::from_gray(200)));
+            ui.label(RichText::new(e.notes.trim()).size(TEXT).color(Color32::from_gray(200)));
         }
         // tracking
         if e.run_id.is_some() {
@@ -548,7 +560,7 @@ fn task_row(
                 ui.label(
                     RichText::new(format!("⏱ {}", fmt_hms(e.tracked_secs)))
                         .monospace()
-                        .size(15.0)
+                        .size(TEXT)
                         .color(Color32::WHITE),
                 );
                 ui.label(RichText::new(format!("/ {}", fmt_hms(est))).monospace().color(Color32::from_gray(150)));
@@ -565,27 +577,26 @@ fn task_row(
                     } else {
                         format!("{}%", (frac * 100.0).round() as i32)
                     };
-                    ui.label(RichText::new(txt).size(12.0).color(col));
+                    ui.label(RichText::new(txt).size(TEXT).color(col));
                 }
             });
             // correct the tracking for work done before pressing Start (while running only)
             if let (EntryStatus::Running, Some(id)) = (e.status, e.run_id) {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
+                preset_row(ui, |ui| {
                     let gray = Color32::from_gray(150);
-                    ui.label(RichText::new("Add earlier work").size(12.0).color(gray));
+                    ui.label(RichText::new("Add earlier work").size(TEXT).color(gray));
                     for (label, secs) in [("+1 min", 60), ("+10 min", 600), ("+1 hour", 3600)] {
                         let tip = "Count time you already worked on this before starting it";
-                        if ui.small_button(label).on_hover_text(tip).clicked() {
+                        if preset_button(ui, false, label).on_hover_text(tip).clicked() {
                             action = Some(Action::AddTime(id, secs));
                         }
                     }
                     if e.added_secs > 0 {
                         ui.add_space(8.0);
                         ui.label(
-                            RichText::new(format!("{} added", fmt_span_min(e.added_secs / 60))).size(12.0).color(gray),
+                            RichText::new(format!("{} added", fmt_span_min(e.added_secs / 60))).size(TEXT).color(gray),
                         );
-                        if ui.small_button("Reset").on_hover_text("Remove the added time again").clicked() {
+                        if preset_button(ui, false, "Reset").on_hover_text("Remove the added time again").clicked() {
                             action = Some(Action::ResetAddedTime(id));
                         }
                     }
@@ -600,7 +611,7 @@ fn task_row(
             if let (Some(secs), Some(id)) = (undo_secs, e.run_id) {
                 let tip = "Clicked by accident? This takes it back: the task is planned again \
                            (and time tracked since then is dropped)";
-                if task_button(ui, &format!("↩ Undo ({secs})"), None, true).on_hover_text(tip).clicked() {
+                if action_button(ui, format!("↩ Undo ({secs})"), Act::Plain, true).on_hover_text(tip).clicked() {
                     action = Some(Action::Undo(id));
                 }
             }

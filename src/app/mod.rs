@@ -111,7 +111,15 @@ impl TaskerApp {
         ctx.set_zoom_factor(settings.ui_scale);
         ctx.global_style_mut(|s| {
             s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            s.spacing.button_padding = egui::vec2(10.0, 4.0);
+            s.spacing.button_padding = crate::widgets::ACTION_PAD_SYM;
+            // One size for all text, a bigger one for headlines (see `widgets`).
+            use egui::{FontFamily, FontId, TextStyle};
+            let text = FontId::new(crate::widgets::TEXT, FontFamily::Proportional);
+            for style in [TextStyle::Small, TextStyle::Body, TextStyle::Button] {
+                s.text_styles.insert(style, text.clone());
+            }
+            s.text_styles.insert(TextStyle::Monospace, FontId::new(crate::widgets::TEXT, FontFamily::Monospace));
+            s.text_styles.insert(TextStyle::Heading, FontId::new(crate::widgets::HEADLINE, FontFamily::Proportional));
         });
 
         let (tx, rx) = mpsc::channel();

@@ -11,7 +11,10 @@ use crate::platform;
 use crate::settings::{Corner, DEFAULT_SNOOZE, Settings, SoundChoice, UI_SCALE_PCT, fmt_snooze};
 use crate::store::Store;
 use crate::views::{month_grid, month_header};
-use crate::widgets::FAILED_RED;
+use crate::widgets::{
+    ACTION_PAD, ACTION_PAD_SYM, ACTION_TEXT, Act, FAILED_RED, HEADLINE, action_button, action_height, choice_button,
+    choice_button_ext, preset_button, preset_row,
+};
 
 /// Dragging a number field changes it by one step per this many points of mouse travel.
 pub const DRAG_POINTS_PER_STEP: f64 = 3.0;
@@ -193,40 +196,34 @@ fn two_digit(v: f64, _: std::ops::RangeInclusive<usize>) -> String {
     format!("{:02}", v as i64)
 }
 
-/// Font size of selector buttons and number fields in the editor (1.5 × body text).
-fn big_size(ui: &Ui) -> f32 {
-    ui.style().text_styles.get(&TextStyle::Body).map_or(12.5, |f| f.size) * 1.5
+/// Text size of every control in the editor (number and text fields too): the action
+/// button size, so all of them have the same height.
+const CTRL_SIZE: f32 = ACTION_TEXT;
+/// Inner padding of the controls (the same for buttons and text fields).
+const CTRL_PAD: egui::Margin = ACTION_PAD;
+/// Width of the row labels on the left of each column.
+const LABEL_W: f32 = 100.0;
+/// Space between two rows of the editor.
+const ROW_GAP: f32 = 14.0;
+
+/// Height of one control: a line of control text plus the padding.
+fn ctrl_h(ui: &Ui) -> f32 {
+    action_height(ui)
 }
 
-/// A selectable button that also shows its box when not selected.
-fn toggle<'a>(on: bool, text: impl Into<egui::WidgetText>) -> egui::Button<'a> {
-    egui::Button::selectable(on, text.into()).frame_when_inactive(true)
-}
-
-/// A toggle button with the big selector font.
+/// A choice button with the control font.
 fn sel(ui: &mut Ui, on: bool, text: impl Into<String>) -> Response {
-    let size = big_size(ui);
-    ui.add(toggle(on, RichText::new(text).size(size)))
+    choice_button(ui, on, text)
 }
 
-/// A line of small preset buttons below a field.
+/// A line of preset buttons below a field.
 fn presets(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        ui.spacing_mut().button_padding = egui::vec2(7.0, 1.0);
-        add(ui);
-    });
+    ui.add_space(2.0);
+    preset_row(ui, add);
 }
 
-/// Number fields with the big font.
-fn big_numbers(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
-    ui.horizontal(|ui| {
-        let size = big_size(ui);
-        for style in [TextStyle::Body, TextStyle::Button, TextStyle::Monospace] {
-            ui.style_mut().text_styles.insert(style, FontId::proportional(size));
-        }
-        add(ui);
-    });
+fn chip(ui: &mut Ui, on: bool, text: impl Into<String>) -> bool {
+    preset_button(ui, on, text).clicked()
 }
 
 /// Always-open month calendar.
@@ -255,99 +252,104 @@ const CAL_W: f32 = 380.0;
 const DAY_GAP: f32 = 4.0;
 /// Width of one day button, so a row of 7 is exactly as wide as the calendar.
 const DAY_BTN_W: f32 = (CAL_W - 6.0 * DAY_GAP) / 7.0;
-const LEFT_FIELD_W: f32 = 360.0;
+const LEFT_FIELD_W: f32 = 540.0;
 
-fn grid(ui: &Ui, id: &str) -> egui::Grid {
-    // rows are separated by half a line of the (big) selector text, on top of normal spacing
-    let row_gap = ui.spacing().item_spacing.y + big_size(ui) * 0.5;
-    egui::Grid::new(id).num_columns(2).spacing([16.0, row_gap]).min_row_height(big_size(ui) + 10.0)
+/// One row of the editor: the label on the left, vertically centered on the row's first
+/// control (not on the whole row, so it stays next to the field it names when presets
+/// or a calendar follow below), and the contents on the right.
+fn row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal_top(|ui| {
+        let size = egui::vec2(LABEL_W, ctrl_h(ui));
+        ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_size(size);
+            ui.label(RichText::new(label).color(Color32::from_gray(170)));
+        });
+        ui.vertical(add);
+    });
+    ui.add_space(ROW_GAP);
 }
 
-fn row_label(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).color(Color32::from_gray(200)));
+/// A row of the settings dialog: label left, aligned with the row's first line.
+fn settings_row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal_top(|ui| {
+        let line_h = ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y;
+        let size = egui::vec2(150.0, line_h.max(ui.spacing().interact_size.y));
+        ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_size(size);
+            ui.label(label);
+        });
+        ui.vertical(add);
+    });
+    ui.add_space(12.0);
+}
+
+/// A number field with the control font.
+fn number<'a>(v: &'a mut u32, max: u32, steps_per_point: f64) -> egui::DragValue<'a> {
+    egui::DragValue::new(v).range(0..=max).speed(steps_per_point / DRAG_POINTS_PER_STEP)
 }
 
 fn details_column(ui: &mut Ui, ed: &mut Editor) {
-    grid(ui, "editor-left").show(ui, |ui| {
-        row_label(ui, "Title");
-        let r = ui
-            .add(egui::TextEdit::singleline(&mut ed.title).desired_width(LEFT_FIELD_W).hint_text("What needs doing?"));
+    let field_w = LEFT_FIELD_W - LABEL_W;
+    row(ui, "Title", |ui| {
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut ed.title)
+                .desired_width(field_w)
+                .margin(CTRL_PAD)
+                .hint_text("What needs doing?"),
+        );
         if ed.focus_title {
             r.request_focus();
             ed.focus_title = false;
         }
-        ui.end_row();
+    });
 
-        row_label(ui, "Notes");
-        ui.add(egui::TextEdit::multiline(&mut ed.notes).desired_rows(3).desired_width(LEFT_FIELD_W));
-        ui.end_row();
+    row(ui, "Notes", |ui| {
+        ui.add(egui::TextEdit::multiline(&mut ed.notes).desired_rows(3).desired_width(field_w).margin(CTRL_PAD));
+    });
 
-        row_label(ui, "Start time");
-        ui.vertical(|ui| {
-            big_numbers(ui, |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut ed.start_h)
-                        .range(0..=23)
-                        .speed(1.0 / DRAG_POINTS_PER_STEP)
-                        .custom_formatter(two_digit),
-                );
-                ui.label(":");
-                ui.add(
-                    egui::DragValue::new(&mut ed.start_m)
-                        .range(0..=59)
-                        .speed(0.5 / DRAG_POINTS_PER_STEP)
-                        .custom_formatter(two_digit),
-                );
-            });
-            presets(ui, |ui| {
-                for h in [7u32, 8, 9, 12, 14, 18, 20] {
-                    if ui.small_button(format!("{h:02}:00")).clicked() {
-                        ed.start_h = h;
-                        ed.start_m = 0;
-                    }
-                }
-            });
+    row(ui, "Start time", |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.add(number(&mut ed.start_h, 23, 1.0).custom_formatter(two_digit));
+            ui.label(":");
+            ui.add(number(&mut ed.start_m, 59, 0.5).custom_formatter(two_digit));
         });
-        ui.end_row();
-
-        row_label(ui, "Estimated time");
-        ui.vertical(|ui| {
-            big_numbers(ui, |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut ed.est_h).range(0..=23).speed(1.0 / DRAG_POINTS_PER_STEP).suffix(" h"),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut ed.est_m).range(0..=59).speed(0.5 / DRAG_POINTS_PER_STEP).suffix(" min"),
-                );
-            });
-            presets(ui, |ui| {
-                for m in [5u32, 15, 30, 45, 60, 90, 120] {
-                    if ui.small_button(fmt_duration_min(m)).clicked() {
-                        ed.est_h = m / 60;
-                        ed.est_m = m % 60;
-                    }
+        presets(ui, |ui| {
+            for h in [7u32, 8, 9, 12, 14, 18, 20] {
+                if chip(ui, ed.start_h == h && ed.start_m == 0, format!("{h:02}:00")) {
+                    ed.start_h = h;
+                    ed.start_m = 0;
                 }
-            });
+            }
         });
-        ui.end_row();
+    });
 
-        row_label(ui, "Priority");
+    row(ui, "Estimate", |ui| {
+        ui.horizontal(|ui| {
+            ui.add(number(&mut ed.est_h, 23, 1.0).suffix(" h"));
+            ui.add(number(&mut ed.est_m, 59, 0.5).suffix(" min"));
+        });
+        presets(ui, |ui| {
+            for m in [5u32, 15, 30, 45, 60, 90, 120] {
+                if chip(ui, ed.est_h * 60 + ed.est_m == m, fmt_duration_min(m)) {
+                    ed.est_h = m / 60;
+                    ed.est_m = m % 60;
+                }
+            }
+        });
+    });
+
+    row(ui, "Priority", |ui| {
         ui.horizontal_wrapped(|ui| {
-            let size = big_size(ui);
             for p in Priority::ALL {
-                let txt = RichText::new(p.label()).size(size).color(if ed.priority == p {
-                    Color32::WHITE
-                } else {
-                    p.color()
-                });
-                if ui.add(toggle(ed.priority == p, txt)).clicked() {
+                if choice_button_ext(ui, ed.priority == p, p.label(), p.color(), egui::Vec2::ZERO).clicked() {
                     ed.priority = p;
                 }
             }
         });
-        ui.end_row();
+    });
 
-        row_label(ui, "Notification");
+    row(ui, "Reminder", |ui| {
         ui.horizontal_wrapped(|ui| {
             for n in NotifyMode::ALL {
                 if sel(ui, ed.notify == n, format!("{} {}", n.icon(), n.label())).clicked() {
@@ -355,36 +357,31 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
                 }
             }
         });
-        ui.end_row();
+    });
 
-        row_label(ui, "Notify ahead");
-        ui.vertical(|ui| {
-            big_numbers(ui, |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut ed.notify_ahead)
-                        .range(0..=240)
-                        .speed(1.0 / DRAG_POINTS_PER_STEP)
-                        .custom_formatter(|v, _| if v < 0.5 { "Off".into() } else { format!("{v:.0} min") })
-                        .custom_parser(|s| {
-                            let s = s.trim().trim_end_matches("min").trim();
-                            if s.eq_ignore_ascii_case("off") { Some(0.0) } else { s.parse().ok() }
-                        }),
-                )
-                .on_hover_text("A short silent notice this many minutes before the start; closes after 10 s");
-                if ed.notify_ahead > 0 {
-                    ui.label(RichText::new("before the start").weak());
-                }
-            });
-            presets(ui, |ui| {
-                for m in [0u32, 5, 10, 15, 30, 60] {
-                    let label = if m == 0 { "Off".to_string() } else { fmt_duration_min(m) };
-                    if ui.small_button(label).clicked() {
-                        ed.notify_ahead = m;
-                    }
-                }
-            });
+    row(ui, "Notify ahead", |ui| {
+        ui.horizontal(|ui| {
+            ui.add(
+                number(&mut ed.notify_ahead, 240, 1.0)
+                    .custom_formatter(|v, _| if v < 0.5 { "Off".into() } else { format!("{v:.0} min") })
+                    .custom_parser(|s| {
+                        let s = s.trim().trim_end_matches("min").trim();
+                        if s.eq_ignore_ascii_case("off") { Some(0.0) } else { s.parse().ok() }
+                    }),
+            )
+            .on_hover_text("A short silent notice this many minutes before the start; closes after 10 s");
+            if ed.notify_ahead > 0 {
+                ui.label(RichText::new("before the start").weak());
+            }
         });
-        ui.end_row();
+        presets(ui, |ui| {
+            for m in [0u32, 5, 10, 15, 30, 60] {
+                let label = if m == 0 { "Off".to_string() } else { fmt_duration_min(m) };
+                if chip(ui, ed.notify_ahead == m, label) {
+                    ed.notify_ahead = m;
+                }
+            }
+        });
     });
 }
 
@@ -395,8 +392,7 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
         ed.last_from = eff;
         ed.from_month = first_of_month(eff);
     }
-    grid(ui, "editor-right").show(ui, |ui| {
-        row_label(ui, "Active on");
+    row(ui, "Active on", |ui| {
         ui.horizontal(|ui| {
             for (m, label) in [(Mode::Date, "Date"), (Mode::Weekdays, "Weekdays"), (Mode::MonthDays, "Month days")] {
                 if sel(ui, ed.mode == m, label).clicked() {
@@ -404,14 +400,12 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
                 }
             }
         });
-        ui.end_row();
+    });
 
-        match ed.mode {
-            Mode::Date => {
-                row_label(ui, "Date");
-                calendar(ui, "date-cal", &mut ed.date_month, &mut ed.date, None);
-                ui.end_row();
-                row_label(ui, "Repeat");
+    match ed.mode {
+        Mode::Date => {
+            row(ui, "Date", |ui| calendar(ui, "date-cal", &mut ed.date_month, &mut ed.date, None));
+            row(ui, "Repeat", |ui| {
                 ui.horizontal(|ui| {
                     for r in Repeat::CHOICES {
                         if sel(ui, ed.repeat == r, r.label()).clicked() {
@@ -419,91 +413,87 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
                         }
                     }
                 });
-                ui.end_row();
-            }
-            Mode::Weekdays => {
-                row_label(ui, "Days");
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = DAY_GAP;
-                        ui.spacing_mut().button_padding.x = 2.0;
-                        let size = big_size(ui);
-                        for (i, name) in WEEKDAY_SHORT.iter().enumerate() {
-                            let on = ed.wd_mask & (1 << i) != 0;
-                            let b = toggle(on, RichText::new(*name).size(size)).min_size(egui::vec2(DAY_BTN_W, 0.0));
-                            if ui.add(b).clicked() {
-                                ed.wd_mask ^= 1 << i;
-                            }
-                        }
-                    });
-                    presets(ui, |ui| {
-                        for (label, mask) in
-                            [("Mon–Fri", 0b001_1111), ("Weekend", 0b110_0000), ("Every day", 0b111_1111), ("Reset", 0)]
-                        {
-                            if ui.small_button(label).clicked() {
-                                ed.wd_mask = mask;
-                            }
-                        }
-                    });
-                });
-                ui.end_row();
-            }
-            Mode::MonthDays => {
-                row_label(ui, "Days");
-                ui.vertical(|ui| {
-                    let size = big_size(ui) * 0.85;
-                    egui::Grid::new("md-grid").spacing([DAY_GAP, DAY_GAP]).show(ui, |ui| {
-                        ui.spacing_mut().button_padding.x = 2.0;
-                        for d in 1..=31u32 {
-                            let on = ed.md_mask & (1 << d) != 0;
-                            let b = toggle(on, RichText::new(d.to_string()).size(size))
-                                .min_size(egui::vec2(DAY_BTN_W, 28.0));
-                            if ui.add(b).clicked() {
-                                ed.md_mask ^= 1 << d;
-                            }
-                            if d % 7 == 0 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-                    presets(ui, |ui| {
-                        for (label, mask) in [("1st", 1u32 << 1), ("1st + 15th", (1 << 1) | (1 << 15)), ("Reset", 0)] {
-                            if ui.small_button(label).clicked() {
-                                ed.md_mask = mask;
-                            }
-                        }
-                    });
-                });
-                ui.end_row();
-            }
-        }
-
-        if ed.mode != Mode::Date {
-            row_label(ui, "Starting");
-            ui.vertical(|ui| {
-                let mut shown = eff;
-                let mut month = ed.from_month;
-                let check = |d: NaiveDate| ed.can_start_on(d);
-                calendar(ui, "from-cal", &mut month, &mut shown, Some(&check));
-                ed.from_month = month;
-                if shown != eff {
-                    ed.from = shown;
-                    ed.last_from = shown;
-                }
             });
-            ui.end_row();
         }
-        // Repeat comes after the calendar, like in the date view.
-        match ed.mode {
-            Mode::Date => {}
-            Mode::Weekdays => {
-                row_label(ui, "Repeat");
+        Mode::Weekdays => {
+            row(ui, "Days", |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = DAY_GAP;
+                    ui.spacing_mut().button_padding.x = 2.0;
+                    for (i, name) in WEEKDAY_SHORT.iter().enumerate() {
+                        let on = ed.wd_mask & (1 << i) != 0;
+                        if choice_button_ext(ui, on, *name, Color32::WHITE, egui::vec2(DAY_BTN_W, 0.0)).clicked() {
+                            ed.wd_mask ^= 1 << i;
+                        }
+                    }
+                });
+                presets(ui, |ui| {
+                    for (label, mask) in [("Mon–Fri", 0b001_1111), ("Weekend", 0b110_0000), ("Every day", 0b111_1111)]
+                    {
+                        if chip(ui, ed.wd_mask == mask, label) {
+                            ed.wd_mask = mask;
+                        }
+                    }
+                    if chip(ui, false, "Clear") {
+                        ed.wd_mask = 0;
+                    }
+                });
+            });
+        }
+        Mode::MonthDays => {
+            row(ui, "Days", |ui| {
+                let h = ctrl_h(ui);
+                egui::Grid::new("md-grid").spacing([DAY_GAP, DAY_GAP]).show(ui, |ui| {
+                    ui.spacing_mut().button_padding.x = 2.0;
+                    for d in 1..=31u32 {
+                        let on = ed.md_mask & (1 << d) != 0;
+                        if choice_button_ext(ui, on, d.to_string(), Color32::WHITE, egui::vec2(DAY_BTN_W, h)).clicked()
+                        {
+                            ed.md_mask ^= 1 << d;
+                        }
+                        if d % 7 == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                presets(ui, |ui| {
+                    for (label, mask) in [("1st", 1u32 << 1), ("1st + 15th", (1 << 1) | (1 << 15))] {
+                        if chip(ui, ed.md_mask == mask, label) {
+                            ed.md_mask = mask;
+                        }
+                    }
+                    if chip(ui, false, "Clear") {
+                        ed.md_mask = 0;
+                    }
+                });
+            });
+        }
+    }
+
+    if ed.mode != Mode::Date {
+        row(ui, "Starting", |ui| {
+            let mut shown = eff;
+            let mut month = ed.from_month;
+            let check = |d: NaiveDate| ed.can_start_on(d);
+            calendar(ui, "from-cal", &mut month, &mut shown, Some(&check));
+            ed.from_month = month;
+            if shown != eff {
+                ed.from = shown;
+                ed.last_from = shown;
+            }
+        });
+    }
+    // Repeat comes after the calendar, like in the date view.
+    match ed.mode {
+        Mode::Date => {}
+        Mode::Weekdays => {
+            row(ui, "Repeat", |ui| {
                 egui::Grid::new("wd-every").spacing([DAY_GAP, DAY_GAP]).show(ui, |ui| {
-                    let size = big_size(ui);
                     for (i, r) in WeekRepeat::ALL.into_iter().enumerate() {
-                        let b = toggle(ed.wd_every == r, RichText::new(r.label()).size(size))
-                            .min_size(egui::vec2((CAL_W - DAY_GAP) / 2.0, 0.0));
-                        if ui.add(b).clicked() {
+                        let w = (CAL_W - DAY_GAP) / 2.0;
+                        if choice_button_ext(ui, ed.wd_every == r, r.label(), Color32::WHITE, egui::vec2(w, 0.0))
+                            .clicked()
+                        {
                             ed.wd_every = r;
                         }
                         if i % 2 == 1 {
@@ -511,20 +501,18 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
                         }
                     }
                 });
-                ui.end_row();
                 if ed.wd_every == WeekRepeat::BiWeekly {
-                    row_label(ui, "");
-                    ui.label(RichText::new("Every 2 weeks, counted from the starting day's week.").small().weak());
-                    ui.end_row();
+                    ui.label(RichText::new("Every 2 weeks, counted from the starting day's week.").weak());
                 }
-            }
-            Mode::MonthDays => {
-                row_label(ui, "Repeat");
-                ui.label(RichText::new("Every month. Months without a selected day skip it.").weak());
-                ui.end_row();
-            }
+            });
         }
-    });
+        Mode::MonthDays => {
+            row(ui, "Repeat", |ui| {
+                ui.add_space(CTRL_PAD.top as f32);
+                ui.label(RichText::new("Every month. Months without a selected day skip it.").weak());
+            });
+        }
+    }
 }
 
 pub fn editor_ui(ctx: &egui::Context, ed: &mut Editor) -> EditorResult {
@@ -543,7 +531,11 @@ pub fn editor_ui(ctx: &egui::Context, ed: &mut Editor) -> EditorResult {
         }
         ui.add_space(8.0);
         let cols = ui.horizontal_top(|ui| {
-            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+            // every control in the columns (fields included) uses the control font
+            ui.spacing_mut().button_padding = ACTION_PAD_SYM;
+            for style in [TextStyle::Body, TextStyle::Button, TextStyle::Monospace] {
+                ui.style_mut().text_styles.insert(style, FontId::proportional(CTRL_SIZE));
+            }
             let left = ui.vertical(|ui| details_column(ui, ed)).response.rect;
             ui.add_space(28.0);
             ui.vertical(|ui| {
@@ -562,25 +554,24 @@ pub fn editor_ui(ctx: &egui::Context, ed: &mut Editor) -> EditorResult {
         ui.add_space(8.0);
         ui.separator();
         ui.horizontal(|ui| {
-            let save = egui::Button::new(RichText::new("Save").strong().color(Color32::WHITE))
-                .fill(Color32::from_rgb(52, 92, 160));
-            if ui.add(save).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl) {
+            let save = action_button(ui, "Save", Act::Primary, true).on_hover_text("Ctrl+Enter");
+            if save.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl) {
                 match ed.to_task() {
                     Ok(t) => result = EditorResult::Save(t),
                     Err(e) => ed.error = Some(e),
                 }
             }
-            if ui.button("Cancel").clicked() {
+            if action_button(ui, "Cancel", Act::Plain, true).clicked() {
                 result = EditorResult::Cancel;
             }
             if let Some(id) = ed.task_id {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ed.confirm_delete {
-                        if ui.button(RichText::new("Really delete").color(Color32::from_rgb(240, 110, 100))).clicked() {
+                        if action_button(ui, "Really delete", Act::Danger, true).clicked() {
                             result = EditorResult::Delete(id);
                         }
-                        ui.label(RichText::new("History is kept.").small().weak());
-                    } else if ui.button("🗑 Delete task").clicked() {
+                        ui.label(RichText::new("History is kept.").weak());
+                    } else if action_button(ui, "🗑 Delete task", Act::Plain, true).clicked() {
                         ed.confirm_delete = true;
                     }
                 });
@@ -673,11 +664,11 @@ fn task_list_row(ui: &mut Ui, t: &Task, info: &str, info_color: Color32) -> bool
                 let (bar, _) = ui.allocate_exact_size(egui::vec2(4.0, 38.0), Sense::hover());
                 ui.painter().rect_filled(bar, 2.0, t.priority.color());
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(&t.title).strong().size(15.0));
-                    ui.label(RichText::new(info).size(12.5).color(info_color));
+                    ui.label(RichText::new(&t.title).strong().size(HEADLINE));
+                    ui.label(RichText::new(info).color(info_color));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    edit = ui.button("✏ Edit").clicked();
+                    edit = action_button(ui, "✏ Edit", Act::Plain, true).clicked();
                 });
             });
         });
@@ -701,7 +692,7 @@ pub fn task_list_ui(ctx: &egui::Context, store: &Store) -> ListResult {
     };
     let section = |ui: &mut Ui, title: &str, n: usize| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(title).strong().size(16.0));
+            ui.label(RichText::new(title).strong().size(HEADLINE));
             ui.label(RichText::new(n.to_string()).weak());
         });
         ui.add_space(2.0);
@@ -711,7 +702,7 @@ pub fn task_list_ui(ctx: &egui::Context, store: &Store) -> ListResult {
         ui.horizontal(|ui| {
             ui.heading("☰ Tasks");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Close").clicked() {
+                if action_button(ui, "Close", Act::Plain, true).clicked() {
                     res = ListResult::Close;
                 }
             });
@@ -776,7 +767,7 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
         ui.horizontal(|ui| {
             ui.heading(format!("📊 {}", task.title));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Close").clicked() {
+                if action_button(ui, "Close", Act::Plain, true).clicked() {
                     open = false;
                 }
             });
@@ -1012,24 +1003,31 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
         ui.add_space(6.0);
         // As wide as the content needs; only the height is limited (vertical scrolling).
         egui::ScrollArea::vertical().max_height((screen.y - 150.0).max(80.0)).show(ui, |ui| {
-            egui::Grid::new("settings-grid").num_columns(2).spacing([14.0, 12.0]).show(ui, |ui| {
-                ui.label("Notification corner");
+            ui.vertical(|ui| {
+                settings_row(ui, "Notification corner", |ui| {
                 egui::Grid::new("corner").spacing([4.0, 4.0]).show(ui, |ui| {
-                    ui.selectable_value(&mut s.corner, Corner::TopLeft, "↖ Top left");
-                    ui.selectable_value(&mut s.corner, Corner::TopRight, "↗ Top right");
+                    if choice_button_ext(ui, s.corner == Corner::TopLeft, "↖ Top left", Color32::WHITE, egui::vec2(150.0, 0.0)).clicked() {
+                        s.corner = Corner::TopLeft;
+                    }
+                    if choice_button_ext(ui, s.corner == Corner::TopRight, "↗ Top right", Color32::WHITE, egui::vec2(150.0, 0.0)).clicked() {
+                        s.corner = Corner::TopRight;
+                    }
                     ui.end_row();
-                    ui.selectable_value(&mut s.corner, Corner::BottomLeft, "↙ Bottom left");
-                    ui.selectable_value(&mut s.corner, Corner::BottomRight, "↘ Bottom right");
+                    if choice_button_ext(ui, s.corner == Corner::BottomLeft, "↙ Bottom left", Color32::WHITE, egui::vec2(150.0, 0.0)).clicked() {
+                        s.corner = Corner::BottomLeft;
+                    }
+                    if choice_button_ext(ui, s.corner == Corner::BottomRight, "↘ Bottom right", Color32::WHITE, egui::vec2(150.0, 0.0)).clicked() {
+                        s.corner = Corner::BottomRight;
+                    }
                     ui.end_row();
                 });
-                ui.end_row();
+                });
 
-                ui.label("Snooze options");
-                ui.vertical(|ui| {
-                    ui.horizontal_wrapped(|ui| {
+                settings_row(ui, "Snooze options", |ui| {
+                    preset_row(ui, |ui| {
                         let mut remove = None;
                         for (i, m) in s.snooze_minutes.iter().enumerate() {
-                            if ui.button(format!("{}  ✕", fmt_snooze(*m))).on_hover_text("Remove").clicked() {
+                            if preset_button(ui, false, format!("{}  ✕", fmt_snooze(*m))).on_hover_text("Remove").clicked() {
                                 remove = Some(i);
                             }
                         }
@@ -1038,20 +1036,23 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                         }
                     });
                     ui.horizontal(|ui| {
+                        // as big as the Add button next to it
+                        for style in [egui::TextStyle::Button, egui::TextStyle::Body] {
+                            ui.style_mut().text_styles.insert(style, FontId::proportional(ACTION_TEXT));
+                        }
+                        ui.spacing_mut().button_padding = ACTION_PAD_SYM;
                         ui.add(egui::DragValue::new(&mut dlg.new_snooze).range(1..=24 * 60).speed(1.0 / DRAG_POINTS_PER_STEP).suffix(" min"));
-                        if ui.button("Add").clicked() && !s.snooze_minutes.contains(&dlg.new_snooze) {
+                        if action_button(ui, "Add", Act::Plain, true).clicked() && !s.snooze_minutes.contains(&dlg.new_snooze) {
                             s.snooze_minutes.push(dlg.new_snooze);
                             s.snooze_minutes.sort_unstable();
                         }
-                        if ui.small_button("Reset").clicked() {
+                        if preset_button(ui, s.snooze_minutes == DEFAULT_SNOOZE, "Defaults").clicked() {
                             s.snooze_minutes = DEFAULT_SNOOZE.to_vec();
                         }
                     });
                 });
-                ui.end_row();
 
-                ui.label("Sound");
-                ui.vertical(|ui| {
+                settings_row(ui, "Sound", |ui| {
                     egui::ComboBox::from_id_salt("sound").selected_text(s.sound.label()).width(200.0).show_ui(ui, |ui| {
                         for c in SoundChoice::ALL {
                             ui.selectable_value(&mut s.sound, c, c.label());
@@ -1060,7 +1061,7 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     if s.sound == SoundChoice::File {
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut s.sound_file).desired_width(300.0).hint_text("path of a sound file"));
-                            if platform::can_pick_file() && ui.button("Browse…").clicked() {
+                            if platform::can_pick_file() && action_button(ui, "Browse…", Act::Plain, true).clicked() {
                                 let out = dlg.browse_result.clone();
                                 let ctx = ctx.clone();
                                 std::thread::spawn(move || {
@@ -1073,21 +1074,19 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                                 });
                             }
                         });
-                        ui.label(RichText::new("WAV, MP3, OGG/Vorbis or FLAC").small().weak());
+                        ui.label(RichText::new("WAV, MP3, OGG/Vorbis or FLAC").weak());
                     }
                 });
-                ui.end_row();
 
-                ui.label("Volume ramp");
-                ui.vertical(|ui| {
+                settings_row(ui, "Volume ramp", |ui| {
                     ui.add(egui::Slider::new(&mut s.start_volume, 0.0..=1.0).text("start volume").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
                     ui.add(egui::Slider::new(&mut s.end_volume, 0.0..=1.0).text("end volume").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
                     ui.add(egui::Slider::new(&mut s.ramp_secs, 0.0..=300.0).text("ramp time").suffix(" s"));
                     ui.horizontal(|ui| {
-                        if ui.button("▶ Test").clicked() {
+                        if action_button(ui, "▶ Test", Act::Plain, true).clicked() {
                             result = SettingsResult::TestSound(s.clone());
                         }
-                        if ui.button("■ Stop").clicked() {
+                        if action_button(ui, "■ Stop", Act::Plain, true).clicked() {
                             result = SettingsResult::StopSound;
                         }
                     });
@@ -1095,10 +1094,8 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                         ui.colored_label(Color32::from_rgb(240, 130, 100), format!("⚠ {err}"));
                     }
                 });
-                ui.end_row();
 
-                ui.label("UI scale");
-                ui.vertical(|ui| {
+                settings_row(ui, "UI scale", |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().slider_width = 230.0;
                         let slider = egui::Slider::new(&mut dlg.scale_pct, UI_SCALE_PCT).suffix(" %").logarithmic(true);
@@ -1108,35 +1105,34 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                         if (r.changed() && !r.dragged()) || r.drag_stopped() {
                             s.ui_scale = dlg.scale_pct as f32 / 100.0;
                         }
-                        if ui.small_button("Reset to 100 %").clicked() {
-                            dlg.scale_pct = 100;
-                            s.ui_scale = 1.0;
+                    });
+                    preset_row(ui, |ui| {
+                        for pct in [80u32, 100, 125, 150, 200] {
+                            if preset_button(ui, dlg.scale_pct == pct, format!("{pct} %")).clicked() {
+                                dlg.scale_pct = pct;
+                                s.ui_scale = pct as f32 / 100.0;
+                            }
                         }
                     });
                     ui.label(
                         RichText::new("Applied when you release the slider; click the number to type a value. Also: Ctrl + / Ctrl − / Ctrl 0.")
-                            .small()
                             .weak(),
                     );
                 });
-                ui.end_row();
 
-                ui.label("Window");
-                ui.vertical(|ui| {
+                settings_row(ui, "Window", |ui| {
                     ui.checkbox(&mut s.close_to_tray, "Close button minimizes to the panel instead of quitting");
                     ui.checkbox(&mut s.start_minimized, "Start minimized to the panel (or start with --minimized)");
                 });
-                ui.end_row();
             });
         });
         ui.add_space(8.0);
         ui.separator();
         ui.horizontal(|ui| {
-            let save = egui::Button::new(RichText::new("Save").strong().color(Color32::WHITE)).fill(Color32::from_rgb(52, 92, 160));
-            if ui.add(save).clicked() {
+            if action_button(ui, "Save", Act::Primary, true).clicked() {
                 result = SettingsResult::Save(s.clone());
             }
-            if ui.button("Cancel").clicked() {
+            if action_button(ui, "Cancel", Act::Plain, true).clicked() {
                 result = SettingsResult::Cancel;
             }
         });

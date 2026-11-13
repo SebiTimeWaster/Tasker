@@ -2,7 +2,8 @@
 //! names:
 //!
 //! - `Screen`: `connect()`, `work_area()` / `monitor_areas()` (usable area of each monitor
-//!   in physical pixels, primary first) and `hide_from_taskbar(title)` for reminders.
+//!   in physical pixels, primary first), `describe()` (monitor data for the log) and
+//!   `hide_from_taskbar(title)` for reminders.
 //! - `Tray`: the panel / notification-area icon (`spawn`, `set_tasks`); its contents
 //!   come from [`crate::tray`].
 //! - `instance`: single-instance handling: `ask_running_to_show()`, `listen()`,

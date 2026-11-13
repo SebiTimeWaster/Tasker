@@ -15,9 +15,12 @@ use crate::audio::PlayRequest;
 use crate::model::*;
 use crate::settings::{Corner, fmt_snooze};
 use crate::store::{NotifState, Store};
-use crate::widgets::{lerp_color, start_offset_labels, task_buttons};
+use crate::widgets::{
+    ACTION_TEXT, Act, HEADLINE, TEXT, action_button, action_height, icon_button, lerp_color, preset_button, preset_row,
+    start_offset_labels, task_buttons,
+};
 
-const NOTIF_SIZE: Vec2 = Vec2::new(400.0, 158.0);
+const NOTIF_SIZE: Vec2 = Vec2::new(440.0, 168.0);
 const NOTIF_MARGIN: f32 = 14.0;
 const NOTIF_GAP: f32 = 10.0;
 /// How long after its start time a reminder reaches full red.
@@ -61,12 +64,17 @@ pub(super) struct Notif {
     opened_at: Instant,
     /// After clicking a task button the notification stays for a second, then closes.
     closing_at: Option<Instant>,
+    /// Meanwhile it shows the task as it was when clicked (the running task would need
+    /// more room than the window has) and what was done instead of the buttons.
+    frozen: Option<(Entry, &'static str)>,
     /// Closes on its own at this time (announcements).
     expires_at: Option<Instant>,
     initial_pos: Pos2,
     last_pos: Pos2,
     frames: u32,
     hidden_from_taskbar: bool,
+    /// Where the window ended up has been written to the log.
+    pos_logged: bool,
     /// UI scale the window was last sized for.
     zoom: f32,
 }
@@ -119,12 +127,14 @@ impl TaskerApp {
                     seq: self.notif_seq,
                     opened_at: instant,
                     closing_at: None,
+                    frozen: None,
                     expires_at: matches!(k, NotifKind::Ahead { .. })
                         .then(|| instant + Duration::from_secs(AHEAD_SHOW_SECS)),
                     initial_pos: Pos2::ZERO,
                     last_pos: Pos2::ZERO,
                     frames: 0,
                     hidden_from_taskbar: false,
+                    pos_logged: false,
                     zoom: 0.0,
                 });
             }
@@ -168,11 +178,9 @@ impl TaskerApp {
         }
     }
 
-    /// Usable area of the primary monitor, in egui points.
-    fn notif_area(&mut self, ctx: &egui::Context) -> egui::Rect {
-        let ppp = ctx.input(|i| i.viewport().native_pixels_per_point).unwrap_or(1.0) * ctx.zoom_factor();
-        // Cached in physical pixels: the UI scale may change while it's cached.
-        let px = match self.work_area {
+    /// Usable area of the primary monitor, in physical pixels (cached for a while).
+    fn notif_area_px(&mut self, ctx: &egui::Context) -> egui::Rect {
+        match self.work_area {
             Some((at, r)) if at.elapsed() < Duration::from_secs(10) => r,
             _ => {
                 let r = self
@@ -186,14 +194,22 @@ impl TaskerApp {
                         let size = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1920.0, 1080.0));
                         egui::Rect::from_min_size(Pos2::ZERO, size * ctx.pixels_per_point())
                     });
+                // Log the monitor data whenever the area changes (and at the first reminder):
+                // placement problems are hard to diagnose from a description of the screen.
+                if self.work_area.is_none_or(|(_, old)| old != r) {
+                    let raw = self.screen.as_ref().map_or("no screen info".into(), |x| x.describe());
+                    crate::logfile::info(format!("reminder area {r:?} (physical pixels); {raw}"));
+                }
                 self.work_area = Some((Instant::now(), r));
                 r
             }
-        };
-        egui::Rect::from_min_max(px.min / ppp, px.max / ppp)
+        }
     }
 
-    fn notif_pos(&self, area: egui::Rect, index: usize) -> Pos2 {
+    /// Position (in points) of the `index`th reminder window in the work area `area_px`
+    /// (physical pixels), for a window with `ppp` pixels per point.
+    fn notif_pos(&self, area_px: egui::Rect, index: usize, ppp: f32) -> Pos2 {
+        let area = egui::Rect::from_min_max(area_px.min / ppp, area_px.max / ppp);
         let step = (NOTIF_SIZE.y + NOTIF_GAP) * index as f32;
         let (left, top) = match self.settings.corner {
             Corner::TopLeft | Corner::BottomLeft => (true, matches!(self.settings.corner, Corner::TopLeft)),
@@ -208,24 +224,35 @@ impl TaskerApp {
         if self.notifs.is_empty() {
             return;
         }
-        let area = self.notif_area(ctx);
+        // Positions are converted to physical pixels with the scale factor of the reminder
+        // window itself, which differs from the main window's when that is on another
+        // monitor with other scaling. Only that factor puts them exactly into the corner.
+        let area = self.notif_area_px(ctx);
+        let main_ppp = ctx.input(|i| i.viewport().native_pixels_per_point).unwrap_or(1.0) * ctx.zoom_factor();
         let now = now_ts();
         let mut actions: Vec<(usize, NotifAction)> = Vec::new();
         for i in 0..self.notifs.len() {
-            let pos = self.notif_pos(area, i);
             let kind = self.notifs[i].kind;
-            let Some(entry) = self.notif_entry(kind, now) else { continue };
+            let (entry, done) = match &self.notifs[i].frozen {
+                Some((e, done)) => (e.clone(), Some(*done)),
+                None => match self.notif_entry(kind, now) {
+                    Some(e) => (e, None),
+                    None => continue,
+                },
+            };
+            // Before the window exists only the main window's scale is known: a guess,
+            // corrected below once the window reports its own.
+            let guess = self.notif_pos(area, i, main_ppp);
             let n = &mut self.notifs[i];
             if n.frames == 0 {
-                n.initial_pos = pos;
-                n.last_pos = pos;
+                n.initial_pos = guess;
+                n.last_pos = guess;
             }
             n.frames += 1;
             let zoom = ctx.zoom_factor();
             let resize = n.zoom != zoom;
             n.zoom = zoom;
-            let move_to = (n.last_pos != pos || n.frames <= 3 || resize).then_some(pos);
-            n.last_pos = pos;
+            let (last_pos, frames) = (n.last_pos, n.frames);
             let title = format!("Tasker reminder #{}", n.seq);
             let builder = ViewportBuilder::default()
                 .with_title(title.clone())
@@ -238,32 +265,55 @@ impl TaskerApp {
                 .with_active(false)
                 .with_taskbar(false)
                 .with_window_type(egui::X11WindowType::Utility);
-            let closing = n.closing_at.is_some();
             let expires_in = n.expires_at.map(|t| t.saturating_duration_since(Instant::now()));
             let give_up_wait = give_up_wait_secs(n.opened_at.elapsed());
             let id = ViewportId::from_hash_of(("tasker-notif", n.seq));
             let this = &*self;
-            let action = ctx.show_viewport_immediate(id, builder, |ui, _class| {
+            let (action, pos, placed) = ctx.show_viewport_immediate(id, builder, |ui, _class| {
+                // this viewport's own pixels per point (UI scale included)
+                let ppp = ui.ctx().pixels_per_point();
+                let pos = this.notif_pos(area, i, ppp);
+                let placed = ui.input(|i| i.viewport().outer_rect).map(|r| (r.min, pos, ppp));
                 if resize {
                     ui.ctx().send_viewport_cmd(ViewportCommand::InnerSize(NOTIF_SIZE));
                 }
-                if let Some(p) = move_to {
-                    ui.ctx().send_viewport_cmd(ViewportCommand::OuterPosition(p));
+                if last_pos != pos || frames <= 3 || resize {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::OuterPosition(pos));
                 }
                 if ui.input(|i| i.viewport().close_requested()) {
                     if !kind.dismissable() {
                         // Alt+F4 & co. must not get rid of a due reminder either.
                         ui.ctx().send_viewport_cmd(ViewportCommand::CancelClose);
                     } else {
-                        return Some(NotifAction::Dismiss);
+                        return (Some(NotifAction::Dismiss), pos, placed);
                     }
                 }
-                this.notification_ui(ui, kind, &entry, closing, expires_in, give_up_wait, now)
+                (this.notification_ui(ui, kind, &entry, done, expires_in, give_up_wait, now), pos, placed)
             });
+            let n = &mut self.notifs[i];
             if let Some(a) = action {
+                if let NotifAction::Task(act) = a {
+                    n.frozen = Some((entry, done_label(act)));
+                }
                 actions.push((i, a));
             }
-            let n = &mut self.notifs[i];
+            n.last_pos = pos;
+            // Once it has settled: where the window actually is (the window manager may
+            // have moved it) next to where it was sent.
+            if !n.pos_logged
+                && n.opened_at.elapsed() > Duration::from_secs(2)
+                && let Some((at, want, ppp)) = placed
+            {
+                n.pos_logged = true;
+                crate::logfile::info(format!(
+                    "reminder #{} window at {:.0},{:.0}, wanted {:.0},{:.0} (physical pixels, scale {ppp:.2})",
+                    n.seq,
+                    at.x * ppp,
+                    at.y * ppp,
+                    want.x * ppp,
+                    want.y * ppp
+                ));
+            }
             if !n.hidden_from_taskbar
                 && n.frames < 120
                 && let Some(x) = &self.screen
@@ -315,7 +365,7 @@ impl TaskerApp {
         ui: &mut Ui,
         kind: NotifKind,
         e: &Entry,
-        closing: bool,
+        done: Option<&str>,
         expires_in: Option<Duration>,
         give_up_wait: u64,
         now: i64,
@@ -336,17 +386,9 @@ impl TaskerApp {
         let frame =
             Frame::new().fill(bg).stroke(Stroke::new(2.0, e.priority.color())).inner_margin(Margin::symmetric(14, 10));
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("⏰").size(18.0));
-                ui.label(RichText::new(&e.title).size(17.0).strong().color(Color32::WHITE));
-                if kind.dismissable() {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add(egui::Button::new("❌").frame(false)).on_hover_text("Dismiss").clicked() {
-                            out = Some(NotifAction::Dismiss);
-                        }
-                    });
-                }
-            });
+            if header(ui, "⏰", &e.title, kind.dismissable()) {
+                out = Some(NotifAction::Dismiss);
+            }
             let info = match kind {
                 NotifKind::Due { date, .. } => {
                     format!(
@@ -364,53 +406,51 @@ impl TaskerApp {
                 NotifKind::Ahead { .. } => String::new(),
             };
             ui.label(RichText::new(info).color(Color32::from_gray(225)));
-            if e.run_id.is_some() {
-                ui.label(
-                    RichText::new(format!("⏱ {}", fmt_hms(e.tracked_secs)))
-                        .monospace()
-                        .size(15.0)
-                        .color(Color32::WHITE),
-                );
-            }
-            // A due reminder has two task buttons, so "12 min overdue" gets its own line
-            // (where the others show the tracked time).
-            let due = matches!(kind, NotifKind::Due { .. });
-            if due {
-                ui.horizontal(|ui| start_offset_labels(ui, e, now, None, true));
-            }
+            // How late it was (due: "12 min overdue"; running: "started 5 min late", next
+            // to the tracked time), so the button row below has room for its buttons.
+            ui.horizontal(|ui| {
+                if e.run_id.is_some() {
+                    ui.label(
+                        RichText::new(format!("⏱ {}", fmt_hms(e.tracked_secs)))
+                            .monospace()
+                            .size(TEXT)
+                            .color(Color32::WHITE),
+                    );
+                }
+                start_offset_labels(ui, e, now, None, true);
+            });
             ui.add_space(2.0);
-            ui.add_enabled_ui(!closing, |ui| {
-                ui.horizontal(|ui| {
-                    if let Some(a) = task_buttons(ui, e, give_up_wait) {
-                        out = Some(NotifAction::Task(a));
-                    }
-                    if !due {
-                        start_offset_labels(ui, e, now, None, true);
-                    }
-                });
-                match kind {
-                    NotifKind::Due { .. } => {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.label(RichText::new("Snooze").small().color(Color32::from_gray(210)));
-                            for &m in &self.settings.snooze_minutes {
-                                if ui.small_button(fmt_snooze(m)).clicked() {
-                                    out = Some(NotifAction::Snooze(m));
-                                }
-                            }
-                        });
-                    }
-                    // Over the estimate: no snoozing, just acknowledge it (it won't come back).
-                    NotifKind::Overrun { .. } | NotifKind::Ahead { .. } => {
-                        let tip = "Close this reminder; it won't be shown again for this task";
-                        if ui.small_button("✕ Dismiss").on_hover_text(tip).clicked() {
-                            out = Some(NotifAction::Dismiss);
-                        }
+            ui.horizontal(|ui| {
+                ui.set_min_height(action_height(ui));
+                if let Some(done) = done {
+                    ui.label(RichText::new(done).size(ACTION_TEXT).strong().color(Color32::WHITE));
+                    return;
+                }
+                if let Some(a) = task_buttons(ui, e, give_up_wait) {
+                    out = Some(NotifAction::Task(a));
+                }
+                // Over the estimate: no snoozing, just acknowledge it (it won't come back).
+                if kind.dismissable() {
+                    let tip = "Close this reminder; it won't be shown again for this task";
+                    if action_button(ui, "✕ Dismiss", Act::Plain, true).on_hover_text(tip).clicked() {
+                        out = Some(NotifAction::Dismiss);
                     }
                 }
             });
+            if let NotifKind::Due { .. } = kind {
+                ui.add_enabled_ui(done.is_none(), |ui| {
+                    preset_row(ui, |ui| {
+                        ui.label(RichText::new("Snooze").color(Color32::from_gray(210)));
+                        for &m in &self.settings.snooze_minutes {
+                            if preset_button(ui, false, fmt_snooze(m)).clicked() {
+                                out = Some(NotifAction::Snooze(m));
+                            }
+                        }
+                    });
+                });
+            }
         });
-        if !closing {
+        if done.is_none() {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
         out
@@ -433,18 +473,12 @@ impl TaskerApp {
         let secs = (scheduled_at(date, e.start_min) - Local::now().naive_local()).num_seconds().max(0);
         let in_min = (secs + 59) / 60;
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("⏳").size(18.0));
-                ui.label(RichText::new(&e.title).size(17.0).strong().color(Color32::WHITE));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(egui::Button::new("❌").frame(false)).on_hover_text("Dismiss").clicked() {
-                        out = Some(NotifAction::Dismiss);
-                    }
-                });
-            });
+            if header(ui, "⏳", &e.title, true) {
+                out = Some(NotifAction::Dismiss);
+            }
             let when = if in_min <= 1 { "in 1 min".to_string() } else { format!("in {in_min} min") };
             ui.label(
-                RichText::new(format!("Starts {when}, at {}", fmt_hm(e.start_min))).size(15.0).color(Color32::WHITE),
+                RichText::new(format!("Starts {when}, at {}", fmt_hm(e.start_min))).size(TEXT).color(Color32::WHITE),
             );
             ui.label(
                 RichText::new(format!("est. {} · {} priority", fmt_duration_min(e.estimate_min), e.priority.label()))
@@ -452,7 +486,7 @@ impl TaskerApp {
             );
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.small_button("✕ Dismiss").clicked() {
+                if action_button(ui, "✕ Dismiss", Act::Plain, true).clicked() {
                     out = Some(NotifAction::Dismiss);
                 }
                 if let Some(left) = expires_in {
@@ -464,6 +498,38 @@ impl TaskerApp {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
         out
     }
+}
+
+/// What a reminder shows for the second between a task button's click and closing.
+fn done_label(a: Action) -> &'static str {
+    match a {
+        Action::Start { .. } => "▶ Started",
+        Action::Fail { .. } => "Given up",
+        Action::Pause(_) => "⏸ Paused",
+        Action::Finish(_) => "✔ Finished",
+        Action::Resume(_) => "▶ Continued",
+        _ => "✔ Done",
+    }
+}
+
+/// Title row of a reminder: icon, title and (if `dismissable`) a ❌ button at the right.
+/// A title too long for the window is cut off with "…" (full title on hover) instead of
+/// widening the content past the window's right edge. Returns whether ❌ was clicked.
+fn header(ui: &mut Ui, icon: &str, title: &str, dismissable: bool) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(icon).size(HEADLINE));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if dismissable && icon_button(ui, "✕").on_hover_text("Dismiss").clicked() {
+                clicked = true;
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let text = RichText::new(title).size(HEADLINE).strong().color(Color32::WHITE);
+                ui.add(egui::Label::new(text).truncate());
+            });
+        });
+    });
+    clicked
 }
 
 /// Seconds until a due reminder's give-up button can be clicked, for a reminder that

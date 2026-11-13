@@ -246,15 +246,12 @@ impl TaskerApp {
                 t
             });
             ui.painter().image(tex.id(), r, egui::Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
-            ui.label(RichText::new("Tasker").strong().size(15.0));
+            ui.label(RichText::new("Tasker").strong().size(crate::widgets::HEADLINE));
             ui.label(RichText::new(Local::now().format("%A, %d %B %Y  %H:%M").to_string()).weak());
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                let btn = |ui: &mut Ui, s: &str, tip: &str| {
-                    ui.add(egui::Button::new(RichText::new(s).size(15.0)).frame(false).min_size(egui::vec2(34.0, 26.0)))
-                        .on_hover_text(tip)
-                };
+                let btn = |ui: &mut Ui, s: &str, tip: &str| crate::widgets::icon_button(ui, s).on_hover_text(tip);
                 if btn(ui, "❌", if self.settings.close_to_tray { "Close to tray" } else { "Quit" }).clicked() {
                     ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                 }
