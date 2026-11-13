@@ -14,7 +14,7 @@ use crate::store::Store;
 use crate::views::{month_grid, month_header};
 use crate::widgets::{
     ACTION_PAD, ACTION_PAD_SYM, ACTION_TEXT, Act, FAILED_RED, HEADLINE, RADIO_GAP, action_button, action_height,
-    choice_button_ext, preset_button, preset_row, radio, radio_row,
+    choice_button_ext, preset_button, preset_row, radio, radio_row, tab_bar,
 };
 
 /// Dragging a number field changes it by one step per this many points of mouse travel.
@@ -289,10 +289,61 @@ fn number<'a>(v: &'a mut u32, max: u32, steps_per_point: f64) -> egui::DragValue
     egui::DragValue::new(v).range(0..=max).speed(steps_per_point / DRAG_POINTS_PER_STEP)
 }
 
+/// Width of the number fields in the dialogs.
+const NUMBER_W: f32 = 100.0;
+
+/// Adds a number field ([`number`]): `NUMBER_W` wide, its value centered (while typing
+/// too), looking like an input field ([`input_style`]).
+fn number_field(ui: &mut Ui, field: egui::DragValue) -> egui::Response {
+    let size = egui::vec2(NUMBER_W, ctrl_h(ui));
+    // A number field being typed into aligns its text like the layout it is in.
+    ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Center), |ui| {
+        input_style(ui);
+        ui.add(field.min_size(size))
+    })
+    .inner
+}
+
+/// Width of every slider in the dialogs.
+const SLIDER_W: f32 = 300.0;
+
+/// A slider for 0–100 % with its value in a number field next to it, then `label`.
+fn percent_slider(ui: &mut Ui, v: &mut f32, label: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().slider_width = SLIDER_W;
+        ui.add(egui::Slider::new(&mut *v, 0.0..=1.0).show_value(false));
+        let field = egui::DragValue::new(v)
+            .range(0.0..=1.0)
+            .speed(0.01 / DRAG_POINTS_PER_STEP)
+            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+            .custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|p| p / 100.0));
+        number_field(ui, field);
+        ui.label(label);
+    });
+}
+
+/// Makes the input fields added to `ui` look like ones: the dark background of text
+/// fields and a thin border (in the divider grey, lighter on hover, highlighted while in use).
+fn input_style(ui: &mut Ui) {
+    let v = ui.visuals_mut();
+    let bg = v.extreme_bg_color;
+    let in_use = v.selection.stroke.color;
+    let w = &mut v.widgets;
+    for (state, border) in
+        [(&mut w.inactive, GRID_LINE), (&mut w.hovered, Color32::from_gray(110)), (&mut w.active, in_use)]
+    {
+        state.weak_bg_fill = bg;
+        state.bg_fill = bg;
+        state.bg_stroke = Stroke::new(1.0, border);
+        state.expansion = 0.0;
+    }
+}
+
 fn details_column(ui: &mut Ui, ed: &mut Editor) {
     let field_w = LEFT_FIELD_W;
     let mut sec = Sections::default();
     sec.add(ui, "Title", |ui| {
+        input_style(ui);
         let r = ui.add(
             egui::TextEdit::singleline(&mut ed.title)
                 .desired_width(field_w)
@@ -306,15 +357,16 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
     });
 
     sec.add(ui, "Notes", |ui| {
+        input_style(ui);
         ui.add(egui::TextEdit::multiline(&mut ed.notes).desired_rows(3).desired_width(field_w).margin(CTRL_PAD));
     });
 
     sec.add(ui, "Start time", |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.add(number(&mut ed.start_h, 23, 1.0).custom_formatter(two_digit));
+            number_field(ui, number(&mut ed.start_h, 23, 1.0).custom_formatter(two_digit));
             ui.label(":");
-            ui.add(number(&mut ed.start_m, 59, 0.5).custom_formatter(two_digit));
+            number_field(ui, number(&mut ed.start_m, 59, 0.5).custom_formatter(two_digit));
         });
         presets(ui, |ui| {
             for h in [7u32, 8, 9, 12, 14, 18, 20] {
@@ -328,8 +380,8 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
 
     sec.add(ui, "Estimate", |ui| {
         ui.horizontal(|ui| {
-            ui.add(number(&mut ed.est_h, 23, 1.0).suffix(" h"));
-            ui.add(number(&mut ed.est_m, 59, 0.5).suffix(" min"));
+            number_field(ui, number(&mut ed.est_h, 23, 1.0).suffix(" h"));
+            number_field(ui, number(&mut ed.est_m, 59, 0.5).suffix(" min"));
         });
         presets(ui, |ui| {
             for m in [5u32, 15, 30, 45, 60, 90, 120] {
@@ -363,7 +415,8 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
 
     sec.add(ui, "Notify ahead", |ui| {
         ui.horizontal(|ui| {
-            ui.add(
+            number_field(
+                ui,
                 number(&mut ed.notify_ahead, 240, 1.0)
                     .custom_formatter(|v, _| if v < 0.5 { "Off".into() } else { format!("{v:.0} min") })
                     .custom_parser(|s| {
@@ -396,15 +449,10 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
         ed.from_month = first_of_month(eff);
     }
     let mut sec = Sections::default();
-    sec.add(ui, "Active on", |ui| {
-        radio_row(ui, |ui| {
-            for (m, label) in [(Mode::Date, "Date"), (Mode::Weekdays, "Weekdays"), (Mode::MonthDays, "Month days")] {
-                if radio(ui, ed.mode == m, label).clicked() {
-                    ed.mode = m;
-                }
-            }
-        });
-    });
+    // what the task is active on: tabs, since this changes the whole rest of the column
+    let tabs = [(Mode::Date, "On a date"), (Mode::Weekdays, "Weekdays"), (Mode::MonthDays, "Month days")];
+    tab_bar(ui, &mut ed.mode, &tabs, CAL_W);
+    ui.add_space(SECTION_GAP - ui.spacing().item_spacing.y);
 
     match ed.mode {
         Mode::Date => {
@@ -1043,7 +1091,7 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                             ui.style_mut().text_styles.insert(style, FontId::proportional(ACTION_TEXT));
                         }
                         ui.spacing_mut().button_padding = ACTION_PAD_SYM;
-                        ui.add(egui::DragValue::new(&mut dlg.new_snooze).range(1..=24 * 60).speed(1.0 / DRAG_POINTS_PER_STEP).suffix(" min"));
+                        number_field(ui, egui::DragValue::new(&mut dlg.new_snooze).range(1..=24 * 60).speed(1.0 / DRAG_POINTS_PER_STEP).suffix(" min"));
                         if action_button(ui, "Add", Act::Plain, true).clicked() && !s.snooze_minutes.contains(&dlg.new_snooze) {
                             s.snooze_minutes.push(dlg.new_snooze);
                             s.snooze_minutes.sort_unstable();
@@ -1062,7 +1110,10 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     });
                     if s.sound == SoundChoice::File {
                         ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut s.sound_file).desired_width(300.0).hint_text("path of a sound file"));
+                            ui.scope(|ui| {
+                                input_style(ui);
+                                ui.add(egui::TextEdit::singleline(&mut s.sound_file).desired_width(300.0).hint_text("path of a sound file"));
+                            });
                             if platform::can_pick_file() && action_button(ui, "Browse…", Act::Plain, true).clicked() {
                                 let out = dlg.browse_result.clone();
                                 let ctx = ctx.clone();
@@ -1081,9 +1132,15 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                 });
 
                 sections.add(ui, "Volume ramp", |ui| {
-                    ui.add(egui::Slider::new(&mut s.start_volume, 0.0..=1.0).text("start volume").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-                    ui.add(egui::Slider::new(&mut s.end_volume, 0.0..=1.0).text("end volume").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-                    ui.add(egui::Slider::new(&mut s.ramp_secs, 0.0..=300.0).text("ramp time").suffix(" s"));
+                    percent_slider(ui, &mut s.start_volume, "start volume");
+                    percent_slider(ui, &mut s.end_volume, "end volume");
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().slider_width = SLIDER_W;
+                        ui.add(egui::Slider::new(&mut s.ramp_secs, 0.0..=300.0).show_value(false));
+                        let secs = egui::DragValue::new(&mut s.ramp_secs).range(0.0..=300.0).speed(1.0 / DRAG_POINTS_PER_STEP).max_decimals(0).suffix(" s");
+                        number_field(ui, secs);
+                        ui.label("ramp time");
+                    });
                     ui.horizontal(|ui| {
                         if action_button(ui, "▶ Test", Act::Plain, true).clicked() {
                             result = SettingsResult::TestSound(s.clone());
@@ -1099,9 +1156,10 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
 
                 sections.add(ui, "UI scale", |ui| {
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().slider_width = 230.0;
-                        let slider = egui::Slider::new(&mut dlg.scale_pct, UI_SCALE_PCT).suffix(" %").logarithmic(true);
-                        let r = ui.add(slider);
+                        ui.spacing_mut().slider_width = SLIDER_W;
+                        let slider = ui.add(egui::Slider::new(&mut dlg.scale_pct, UI_SCALE_PCT).logarithmic(true).show_value(false));
+                        let field = egui::DragValue::new(&mut dlg.scale_pct).range(UI_SCALE_PCT).speed(1.0 / DRAG_POINTS_PER_STEP).suffix(" %");
+                        let r = slider | number_field(ui, field);
                         // Rescaling while dragging would move the slider away under the mouse,
                         // so the preview is applied on release (or after typing a value).
                         if (r.changed() && !r.dragged()) || r.drag_stopped() {
@@ -1117,7 +1175,7 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                         }
                     });
                     ui.label(
-                        RichText::new("Applied when you release the slider; click the number to type a value. Also: Ctrl + / Ctrl − / Ctrl 0.")
+                        RichText::new("Applied when you release the slider; click the number to type a value.\nKeyboard Shortcuts: Ctrl + / Ctrl − / Ctrl 0.")
                             .weak(),
                     );
                 });

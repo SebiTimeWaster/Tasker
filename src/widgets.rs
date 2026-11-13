@@ -171,6 +171,44 @@ pub fn radio_row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 /// Space between the options of a [`radio_row`] (and between the columns of a grid of them).
 pub const RADIO_GAP: f32 = 18.0;
 
+/// A tab bar `width` wide: one equally wide tab per option in `tabs`, the chosen one
+/// (`current`) underlined, on a divider line. For a choice that changes everything below
+/// it rather than a single value. Returns whether the choice changed.
+pub fn tab_bar<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, tabs: &[(T, &str)], width: f32) -> bool {
+    let h = action_height(ui);
+    let (bar, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+    let tab_w = width / tabs.len() as f32;
+    let accent = ui.visuals().selection.bg_fill;
+    let p = ui.painter().clone();
+    p.hline(bar.x_range(), bar.bottom() - 0.5, egui::Stroke::new(1.0, crate::app::GRID_LINE));
+    let mut changed = false;
+    for (i, &(value, label)) in tabs.iter().enumerate() {
+        let r = egui::Rect::from_min_size(bar.min + egui::vec2(tab_w * i as f32, 0.0), egui::vec2(tab_w, h));
+        let resp = ui.interact(r, ui.make_persistent_id(("tab", i)), egui::Sense::click());
+        let on = *current == value;
+        if resp.clicked() && !on {
+            *current = value;
+            changed = true;
+        }
+        let color = if on {
+            Color32::WHITE
+        } else if resp.hovered() {
+            Color32::from_gray(210)
+        } else {
+            Color32::from_gray(150)
+        };
+        p.text(r.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(ACTION_TEXT), color);
+        if on {
+            let line = egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - 2.0), r.max);
+            p.rect_filled(line, 0.0, accent);
+        } else if resp.hovered() {
+            let line = egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - 2.0), r.max);
+            p.rect_filled(line, 0.0, Color32::from_gray(90));
+        }
+    }
+    changed
+}
+
 /// A preset button (see above); `on`: its value is the current one.
 pub fn preset_button(ui: &mut Ui, on: bool, text: impl Into<String>) -> egui::Response {
     let text = RichText::new(text).size(PRESET_TEXT);
