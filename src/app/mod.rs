@@ -375,7 +375,7 @@ impl eframe::App for TaskerApp {
             crate::views::left_column(self, ui);
         });
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(Color32::from_gray(36)))
+            .frame(Frame::new().fill(crate::views::DAY_BG))
             .show(ui, |ui| crate::views::day_view(self, ui));
 
         // Thin outline, since there are no system decorations.

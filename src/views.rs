@@ -7,8 +7,8 @@ use chrono::{Datelike, Duration, NaiveDate};
 use egui::epaint::Mesh;
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
-    Align, Align2, Color32, FontId, Frame, Galley, Id, Layout, Margin, Pos2, Rect, RichText, ScrollArea, Sense, Stroke,
-    Ui, UiBuilder,
+    Align, Align2, Color32, FontId, Frame, Galley, Id, Layout, Margin, Pos2, Rect, Response, RichText, ScrollArea,
+    Sense, Stroke, Ui, UiBuilder,
 };
 
 use crate::action::Action;
@@ -23,6 +23,8 @@ use crate::widgets::{
 const ACCENT: Color32 = Color32::from_rgb(90, 140, 210);
 /// Background of the hour timeline (and of the reminder windows).
 pub const TIMELINE_BG: Color32 = Color32::from_gray(26);
+/// Background of the day view, so also of the task rows that aren't given up.
+pub const DAY_BG: Color32 = Color32::from_gray(36);
 
 pub fn elided(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<Galley> {
     let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
@@ -462,15 +464,34 @@ fn connectors(ui: &Ui, tl: Rect, gap: Rect, viewport: Rect, entries: &[Entry], d
     }
 }
 
-fn status_chip(ui: &mut Ui, text: &str, color: Color32) {
+const STATUS_CHIP_MARGIN: Margin = Margin::symmetric(6, 1);
+
+fn status_chip_text(text: &str, color: Color32) -> RichText {
+    RichText::new(text).size(TEXT).color(color)
+}
+
+/// The width `status_chip` takes for `text`: the text, its margins and the border.
+fn status_chip_width(ui: &Ui, text: &str) -> f32 {
+    text_width(ui, status_chip_text(text, Color32::WHITE)) + STATUS_CHIP_MARGIN.sum().x + 2.0
+}
+
+fn text_width(ui: &Ui, text: RichText) -> f32 {
+    egui::WidgetText::from(text)
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
+        .size()
+        .x
+}
+
+/// A status label: no fill, square corners and a thin border in the colour of the
+/// dividers, so that it doesn't look like a button.
+fn status_chip(ui: &mut Ui, text: &str, color: Color32) -> Response {
     Frame::new()
-        .fill(color.gamma_multiply(0.25))
-        .stroke(Stroke::new(1.0, color))
-        .corner_radius(8)
-        .inner_margin(Margin::symmetric(6, 1))
+        .stroke(Stroke::new(1.0, GRID_LINE))
+        .inner_margin(STATUS_CHIP_MARGIN)
         .show(ui, |ui| {
-            ui.label(RichText::new(text).size(TEXT).color(color));
-        });
+            ui.label(status_chip_text(text, color));
+        })
+        .response
 }
 
 /// One task in the list of `day`. Takes as much height as its content needs. Done tasks
@@ -497,19 +518,16 @@ fn task_row(
         }
         ui.spacing_mut().item_spacing.y = 5.0;
         // title line, as high as its ✏ button whether that is shown or not
+        let (chip, chip_color) = match e.status {
+            EntryStatus::Virtual => ("planned", Color32::from_gray(160)),
+            EntryStatus::Running => ("running", Color32::from_rgb(110, 200, 130)),
+            EntryStatus::Paused => ("paused", Color32::from_rgb(230, 180, 80)),
+            EntryStatus::Done => ("done", Color32::from_rgb(140, 170, 150)),
+            EntryStatus::Failed => ("failed", Color32::from_rgb(240, 120, 110)),
+        };
         ui.horizontal(|ui| {
             ui.set_min_height(action_height(ui));
-            ui.label(RichText::new(&e.title).size(HEADLINE).strong().color(Color32::WHITE));
-            match e.status {
-                EntryStatus::Virtual => status_chip(ui, "planned", Color32::from_gray(160)),
-                EntryStatus::Running => status_chip(ui, "running", Color32::from_rgb(110, 200, 130)),
-                EntryStatus::Paused => status_chip(ui, "paused", Color32::from_rgb(230, 180, 80)),
-                EntryStatus::Done => status_chip(ui, "done", Color32::from_rgb(140, 170, 150)),
-                EntryStatus::Failed => status_chip(ui, "failed", Color32::from_rgb(240, 120, 110)),
-            }
-            if e.recurring {
-                ui.label(RichText::new("⟳").color(Color32::from_gray(160))).on_hover_text("Recurring task");
-            }
+            // The buttons at the right first, so that the title knows how much room is left.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // A started one-off task has nothing left to edit (its data is fixed now).
                 if e.task_exists && (e.recurring || e.run_id.is_none()) {
@@ -525,6 +543,26 @@ fn task_row(
                         action = Some(Action::Stats(e.task_id));
                     }
                 }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    let gap = ui.spacing().item_spacing.x;
+                    // what follows the title: twice the usual gap, the status label, the ⟳
+                    let mut tail = 2.0 * gap + status_chip_width(ui, chip);
+                    if e.recurring {
+                        tail += gap + status_chip_width(ui, "⟳");
+                    }
+                    let room = (ui.available_width() - tail).max(0.0);
+                    let title = RichText::new(&e.title).size(HEADLINE).strong().color(Color32::WHITE);
+                    // a long title ends in “…” (and shows in full on hover)
+                    ui.scope(|ui| {
+                        ui.set_max_width(room);
+                        ui.add(egui::Label::new(title).truncate());
+                    });
+                    ui.add_space(gap);
+                    status_chip(ui, chip, chip_color);
+                    if e.recurring {
+                        status_chip(ui, "⟳", Color32::from_gray(160)).on_hover_text("Recurring task");
+                    }
+                });
             });
         });
         // meta line
