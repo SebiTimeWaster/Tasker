@@ -13,7 +13,7 @@ use crate::settings::{Corner, DEFAULT_SNOOZE, Settings, SoundChoice, UI_SCALE_PC
 use crate::store::Store;
 use crate::views::{month_grid, month_header};
 use crate::widgets::{
-    ACTION_PAD, ACTION_PAD_SYM, ACTION_TEXT, Act, FAILED_RED, HEADLINE, RADIO_GAP, action_button, action_height,
+    ACTION_PAD, ACTION_PAD_SYM, ACTION_TEXT, Act, FAILED_RED, HEADLINE, RADIO_GAP, TEXT, action_button, action_height,
     choice_button_ext, preset_button, preset_row, radio, radio_row, tab_bar,
 };
 
@@ -983,19 +983,30 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
             p.add(egui::Shape::dashed_line(&est_line, Stroke::new(1.5, old_col), 6.0, 4.0));
         }
         p.hline(plot.x_range(), y_of(task.estimate_min as f32), Stroke::new(1.5, cur_col));
-        ui.horizontal(|ui| {
-            let legend = |ui: &mut Ui, c: Color32, t: &str| {
-                let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
-                ui.painter().rect_filled(r, 2.0, c);
-                ui.label(RichText::new(t).small());
+        // As wide as the chart: entries that don't fit move to the next line as a whole.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 14.0;
+            let text_color = ui.visuals().text_color();
+            // a color square (if any) and its text, as one piece
+            let entry = |ui: &mut Ui, square: Option<Color32>, t: &str, color: Color32| {
+                let g = ui.fonts_mut(|f| f.layout_no_wrap(t.to_string(), FontId::proportional(TEXT), color));
+                let pad = if square.is_some() { 16.0 } else { 0.0 };
+                let (r, _) = ui.allocate_exact_size(egui::vec2(pad + g.size().x, g.size().y), Sense::hover());
+                if let Some(c) = square {
+                    let sq = Rect::from_center_size(egui::pos2(r.left() + 5.0, r.center().y), egui::vec2(10.0, 10.0));
+                    ui.painter().rect_filled(sq, 2.0, c);
+                }
+                ui.painter().galley(egui::pos2(r.left() + pad, r.top()), g, color);
             };
-            legend(ui, Color32::from_rgb(80, 160, 105), "within estimate");
-            legend(ui, Color32::from_rgb(220, 130, 60), "over estimate");
-            legend(ui, cur_col, "— current estimate");
+            entry(ui, Some(Color32::from_rgb(80, 160, 105)), "within estimate", text_color);
+            entry(ui, Some(Color32::from_rgb(220, 130, 60)), "over estimate", text_color);
+            entry(ui, Some(cur_col), "— current estimate", text_color);
             if changed_estimate {
-                legend(ui, old_col, "- - estimate when started");
+                entry(ui, Some(old_col), "- - estimate when started", text_color);
             }
-            ui.label(RichText::new("✕ missed   ● on time / late (dot below bar)").small().weak());
+            let weak = ui.visuals().weak_text_color();
+            entry(ui, None, "✕ missed", weak);
+            entry(ui, None, "● on time / late (dot below bar)", weak);
         });
     });
     if modal.should_close() {
