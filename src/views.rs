@@ -273,7 +273,8 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
 const TIMELINE_W: f32 = 64.0;
 /// Width of the stripe in the priority color on the left of each task.
 const PRIORITY_STRIPE_W: f32 = 6.0;
-const CONNECTOR_W: f32 = 70.0;
+/// Width of the area between the timeline and the task list where the connectors run.
+const CONNECTOR_W: f32 = TIMELINE_W;
 const HEADER_H: f32 = 44.0;
 
 pub fn day_view(app: &mut TaskerApp, ui: &mut Ui) {
@@ -387,11 +388,12 @@ fn timeline(ui: &Ui, tl: Rect, entries: &[Entry], day: NaiveDate) {
         let y = minute_y(tl, h * 60);
         let major = h % 6 == 0;
         let col = if major { Color32::from_gray(85) } else { Color32::from_gray(55) };
-        p.hline(egui::Rangef::new(tl.left() + if major { 0.0 } else { 34.0 }, tl.right()), y, Stroke::new(1.0, col));
+        p.hline(egui::Rangef::new(tl.left() + if major { 0.0 } else { 24.0 }, tl.right()), y, Stroke::new(1.0, col));
         if h < 24 && h % label_every == 0 {
+            // in the middle of the hour it names
             p.text(
-                egui::pos2(tl.left() + 5.0, y + 1.0),
-                Align2::LEFT_TOP,
+                egui::pos2(tl.left() + 5.0, y + hour_h / 2.0),
+                Align2::LEFT_CENTER,
                 format!("{h:02}:00"),
                 FontId::monospace(10.0),
                 Color32::from_gray(if major { 190 } else { 140 }),
