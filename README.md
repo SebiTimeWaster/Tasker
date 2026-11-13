@@ -106,7 +106,12 @@ data lives in `%APPDATA%\tasker\tasker.db` and the log in `%LOCALAPPDATA%\tasker
 * **Across midnight**: a task whose planned time goes past midnight (23:00 for 2 h) is on
   both days: until midnight on its own day, from midnight on the next one ("23:00 (day
   before) – 01:00"). It is still one task: start it on either day. The calendar dots and
-  the week list count it on both days; its tracked time counts for its own day.
+  the week list count it on both days; its tracked time counts for its own day. Estimates
+  go up to 47 h 59 min, so a task can reach into the day after next ("(2 days before)").
+* **New tasks** start at the next full hour (today) or 09:00, with the estimate, priority,
+  reminder and notify ahead time from Settings → New task defaults. The editor's preset
+  buttons for the start time and for durations (estimate, notify ahead) are set in the
+  settings too. Time fields are an hour and a minute field: drag them, type, or use ↑ / ↓.
 * **Schedules**
   * *A date*: once, or every year on that date (29 Feb falls back to 28 Feb).
   * *Weekdays* (any combination): every week, every 2 weeks (counted from the start
@@ -139,16 +144,18 @@ data lives in `%APPDATA%\tasker\tasker.db` and the log in `%LOCALAPPDATA%\tasker
   that was due yesterday keeps its reminder (and a snoozed one comes back) until the end of
   today, unless it is started or given up; a task shortly after midnight is announced
   before midnight.
-* **Notify ahead** (per task, in minutes): a short announcement that the task starts soon.
-  It has only a Dismiss button, plays no sound and closes by itself after 10 seconds.
+* **Notify ahead** (per task, up to 23 h 59 min): a short announcement that the task starts
+  soon. It has only a Dismiss button and plays no sound. It closes by itself after 10
+  seconds, or another time, or stays until dismissed (Settings → "Starts soon" notice).
 * Reminders are drawn by Tasker itself (not the system's notification service), in the
-  configured screen corner, stacked and always on top. The longer they are overdue, the
-  redder they get (full red after 60 min).
+  configured screen corner, stacked and always on top. The line saying how late a task is
+  starts in the reminder's own color and turns red with lateness (full red after 60 min).
 * They offer the same buttons as the task (start / pause / finish / resume). Clicking one
   closes the reminder after a second. A due reminder has no close button: it stays until
-  the task is started or given up, and only the snooze buttons (default 5 / 10 / 30 min,
-  1 h, 2 h) put it off. Its **I am bad and won't do it** button can only be clicked after
-  the reminder has been open for 10 seconds (it counts them down; this is not a setting).
+  the task is started or given up, and only the snooze buttons (5 / 10 / 30 min, 1 h, 2 h)
+  put it off, once: when a snoozed reminder comes back, it has no snooze buttons. Its
+  **I am bad and won't do it** button can only be clicked after the reminder has been open
+  for 10 seconds (it counts them down; this is not a setting).
   Over-estimate reminders and announcements can be dismissed. Snoozing and dismissing are
   saved, so a restart doesn't bring them back.
 * Sound loops while a reminder is open, with a volume ramp (start volume → end volume over
@@ -213,3 +220,10 @@ runs the checks above on every push (`.github/workflows/ci.yml`).
 
 In VS Code, Ctrl+Shift+B runs `cargo build --release`; "Tasks: Run Task" also offers a debug build
 (`.vscode/tasks.json`).
+
+## To do
+
+* **Reminder monitor**: choose which monitor shows the reminders (they are always on the
+  primary one now), next to the corner setting.
+* **i18n**: translations; the texts are English only.
+* **Distro packaging**: packages for Linux distributions (e.g. .deb, Flatpak, AUR).

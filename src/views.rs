@@ -61,7 +61,7 @@ pub fn left_column(app: &mut TaskerApp, ui: &mut Ui) {
         .fill(PRIMARY_BLUE)
         .corner_radius(4);
     if ui.place(btn_rect, btn).clicked() {
-        app.editor = Some(Editor::new(app.selected));
+        app.editor = Some(Editor::new(app.selected).with_defaults(&app.settings.new_task));
     }
 }
 

@@ -10,7 +10,8 @@ use crate::audio::Audio;
 use crate::model::*;
 use crate::platform;
 use crate::settings::{
-    Corner, DEFAULT_START_PRESETS, DEFAULT_TIME_PRESETS, MAX_DURATION_MIN, Settings, SoundChoice, UI_SCALE_PCT,
+    AHEAD_CLOSE_SECS, Corner, DEFAULT_START_PRESETS, DEFAULT_TIME_PRESETS, MAX_DURATION_MIN, NewTaskDefaults, Settings,
+    SoundChoice, UI_SCALE_PCT,
 };
 use crate::store::Store;
 use crate::views::{month_grid, month_header};
@@ -103,6 +104,17 @@ impl Editor {
             focus_title: true,
             schedule_h: 0.0,
         }
+    }
+
+    /// A new task's values as set in the settings.
+    pub fn with_defaults(mut self, d: &NewTaskDefaults) -> Self {
+        let estimate = d.estimate_min.min(MAX_ESTIMATE_MIN);
+        self.est_h = estimate / 60;
+        self.est_m = estimate % 60;
+        self.priority = d.priority;
+        self.notify = d.notify;
+        self.notify_ahead = d.notify_ahead_min.min(MAX_NOTIFY_AHEAD_MIN);
+        self
     }
 
     pub fn from_task(t: &Task) -> Self {
@@ -347,7 +359,7 @@ enum TimeKind {
 /// Hours (up to `max_h`) and minutes as two number fields, for a time of day or a length
 /// of time (`kind`).
 fn hm_fields(ui: &mut Ui, h: &mut u32, m: &mut u32, max_h: u32, kind: TimeKind) -> egui::Response {
-    ui.horizontal(|ui| {
+    field_row(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
         let a = number_field(ui, h, 0..=max_h, 1.0, TIME_FIELD_W, |f| {
             if kind == TimeKind::OfDay { f.custom_formatter(two_digit) } else { f }
@@ -359,7 +371,6 @@ fn hm_fields(ui: &mut Ui, h: &mut u32, m: &mut u32, max_h: u32, kind: TimeKind) 
         }
         a | b
     })
-    .inner
 }
 
 /// [`hm_fields`] for a value in minutes.
@@ -368,6 +379,59 @@ fn minutes_fields(ui: &mut Ui, v: &mut u32, max_h: u32, kind: TimeKind) -> egui:
     let r = hm_fields(ui, &mut h, &mut m, max_h, kind);
     *v = h * 60 + m;
     r
+}
+
+/// What follows the notify ahead fields.
+fn notify_ahead_note(min: u32) -> &'static str {
+    if min > 0 { "before the start" } else { "(off)" }
+}
+
+/// A row as tall as a number field, its contents centered vertically (a plain
+/// `horizontal` centers what comes before the first field in a lower row).
+fn field_row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let size = egui::vec2(ui.available_width(), ctrl_h(ui));
+    ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), add).inner
+}
+
+/// The settings for what a new task starts with: the editor's estimate, priority,
+/// reminder and notify ahead controls, each with a label in front.
+fn new_task_defaults(ui: &mut Ui, d: &mut NewTaskDefaults) {
+    const LABEL_W: f32 = 110.0;
+    let row = |ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui)| {
+        field_row(ui, |ui| {
+            // painted into a box as tall as the fields, so what follows is centered on it
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(LABEL_W, ctrl_h(ui)), egui::Sense::hover());
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let color = ui.visuals().weak_text_color();
+            ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, label, font, color);
+            add(ui);
+        });
+    };
+    row(ui, "Estimate", &mut |ui| {
+        minutes_fields(ui, &mut d.estimate_min, MAX_ESTIMATE_MIN / 60, TimeKind::Span);
+    });
+    row(ui, "Priority", &mut |ui| {
+        radio_row(ui, |ui| {
+            for p in Priority::ALL {
+                if radio(ui, d.priority == p, RichText::new(p.label()).color(p.color())).clicked() {
+                    d.priority = p;
+                }
+            }
+        });
+    });
+    row(ui, "Reminder", &mut |ui| {
+        radio_row(ui, |ui| {
+            for n in NotifyMode::ALL {
+                if radio(ui, d.notify == n, format!("{} {}", n.icon(), n.label())).clicked() {
+                    d.notify = n;
+                }
+            }
+        });
+    });
+    row(ui, "Notify ahead", &mut |ui| {
+        minutes_fields(ui, &mut d.notify_ahead_min, MAX_NOTIFY_AHEAD_MIN / 60, TimeKind::Span);
+        ui.label(RichText::new(notify_ahead_note(d.notify_ahead_min)).weak());
+    });
 }
 
 /// Width of the settings dialog's content.
@@ -474,10 +538,14 @@ fn details_column(ui: &mut Ui, ed: &mut Editor, settings: &Settings) {
 
     sec.add(ui, "Notify ahead", |ui| {
         ui.horizontal(|ui| {
+            let closes = if settings.ahead_stays {
+                "stays until dismissed".to_string()
+            } else {
+                format!("closes after {} s", settings.ahead_close_secs)
+            };
             minutes_fields(ui, &mut ed.notify_ahead, MAX_NOTIFY_AHEAD_MIN / 60, TimeKind::Span)
-                .on_hover_text("A short silent notice this long before the start; closes after 10 s");
-            let note = if ed.notify_ahead > 0 { "before the start" } else { "(off)" };
-            ui.label(RichText::new(note).weak());
+                .on_hover_text(format!("A short silent notice this long before the start; {closes}"));
+            ui.label(RichText::new(notify_ahead_note(ed.notify_ahead)).weak());
         });
         presets(ui, |ui| {
             // "Off" always comes first; the others are set in the settings
@@ -1188,6 +1256,25 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                             }
                         }
                     });
+                });
+
+                sections.add(ui, "\"Starts soon\" notice", |ui| {
+                    field_row(ui, |ui| {
+                        if radio(ui, !s.ahead_stays, "Closes on its own after").clicked() {
+                            s.ahead_stays = false;
+                        }
+                        ui.add_enabled_ui(!s.ahead_stays, |ui| {
+                            number_field(ui, &mut s.ahead_close_secs, AHEAD_CLOSE_SECS, 1.0, TIME_FIELD_W, |f| f);
+                            ui.label("s");
+                        });
+                    });
+                    if radio(ui, s.ahead_stays, "Stays until dismissed").clicked() {
+                        s.ahead_stays = true;
+                    }
+                });
+
+                sections.add(ui, "New task defaults", |ui| {
+                    new_task_defaults(ui, &mut s.new_task);
                 });
 
                 sections.add(ui, "Start time presets", |ui| {

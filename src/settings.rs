@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::model::{NotifyMode, Priority};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Corner {
     TopLeft,
@@ -37,6 +39,12 @@ pub struct Settings {
     /// Preset buttons for a task's estimate and its "notify ahead" time in the editor
     /// (minutes); for "notify ahead" an "Off" button comes before them anyway.
     pub time_presets: Vec<u32>,
+    /// What a new task starts with in the editor.
+    pub new_task: NewTaskDefaults,
+    /// Whether a "starts soon" notice stays until it is dismissed, instead of closing on
+    /// its own after `ahead_close_secs`.
+    pub ahead_stays: bool,
+    pub ahead_close_secs: u32,
     pub sound: SoundChoice,
     pub sound_file: String,
     /// Seconds to ramp from `start_volume` to `end_volume`.
@@ -50,6 +58,25 @@ pub struct Settings {
     /// Zoom of the whole UI (1.0 = 100 %). Ctrl +/- / Ctrl 0 change it too.
     pub ui_scale: f32,
 }
+
+/// The values of a new task in the editor (the start time is the next full hour).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NewTaskDefaults {
+    pub estimate_min: u32,
+    pub priority: Priority,
+    pub notify: NotifyMode,
+    pub notify_ahead_min: u32,
+}
+
+impl Default for NewTaskDefaults {
+    fn default() -> Self {
+        NewTaskDefaults { estimate_min: 30, priority: Priority::Normal, notify: NotifyMode::Sound, notify_ahead_min: 0 }
+    }
+}
+
+/// Allowed time (seconds) for a "starts soon" notice to close on its own.
+pub const AHEAD_CLOSE_SECS: std::ops::RangeInclusive<u32> = 1..=300;
 
 /// Main window size at 100 % UI scale: the size on first start and the minimum size.
 /// Both grow with the UI scale (limited to the screen).
@@ -104,6 +131,9 @@ impl Default for Settings {
             corner: Corner::BottomRight,
             start_presets: DEFAULT_START_PRESETS.to_vec(),
             time_presets: DEFAULT_TIME_PRESETS.to_vec(),
+            new_task: NewTaskDefaults::default(),
+            ahead_stays: false,
+            ahead_close_secs: 10,
             sound: SoundChoice::Chime,
             sound_file: String::new(),
             ramp_secs: 30.0,
@@ -157,6 +187,8 @@ mod tests {
         assert_eq!(s.corner, Corner::TopLeft);
         assert_eq!(s.start_presets, DEFAULT_START_PRESETS);
         assert_eq!(s.time_presets, DEFAULT_TIME_PRESETS);
+        assert_eq!(s.new_task, NewTaskDefaults::default());
+        assert_eq!((s.ahead_stays, s.ahead_close_secs), (false, 10));
         assert_eq!(s.sound, SoundChoice::Bell);
         assert_eq!(s.ui_scale, 1.0);
         assert_eq!(s.ramp_secs, Settings::default().ramp_secs);

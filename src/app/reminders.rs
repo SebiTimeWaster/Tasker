@@ -30,8 +30,6 @@ const REMINDER_MARGIN_Y: f32 = 12.0;
 const REMINDER_BAR_W: f32 = 10.0;
 /// How long after its start time a reminder reaches full red.
 const OVERDUE_FULL_RED_MIN: f32 = 60.0;
-/// The "starts soon" announcement closes on its own after this long.
-const AHEAD_SHOW_SECS: u64 = 10;
 /// A due reminder has to be endured (sound included) for this long before its
 /// "I am bad and won't do it" button can be clicked. Deliberately not a setting.
 const GIVE_UP_WAIT_SECS: u64 = 10;
@@ -143,8 +141,9 @@ impl TaskerApp {
                     opened_at: instant,
                     closing_at: None,
                     frozen: None,
-                    expires_at: matches!(k, NotifKind::Ahead { .. })
-                        .then(|| instant + Duration::from_secs(AHEAD_SHOW_SECS)),
+                    // a "starts soon" notice closes on its own, unless set to stay
+                    expires_at: (matches!(k, NotifKind::Ahead { .. }) && !self.settings.ahead_stays)
+                        .then(|| instant + Duration::from_secs(self.settings.ahead_close_secs.into())),
                     initial_pos: Pos2::ZERO,
                     last_pos: Pos2::ZERO,
                     frames: 0,
@@ -411,7 +410,8 @@ impl TaskerApp {
         };
         // Only the lines saying how late it is get the red, which deepens with lateness.
         let t = (overdue_min / OVERDUE_FULL_RED_MIN).clamp(0.0, 1.0);
-        let alarm = lerp_color(Color32::from_rgb(92, 36, 38), Color32::from_rgb(150, 28, 28), t);
+        // from the reminder's own background (just late) to full red
+        let alarm = lerp_color(TIMELINE_BG, Color32::from_rgb(150, 28, 28), t);
         let mut out = None;
         let height = reminder_frame(ui, TIMELINE_BG, e.priority.color(), |ui| {
             header(ui, "⏰", &e.title);
