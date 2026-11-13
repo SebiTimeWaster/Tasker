@@ -12,7 +12,7 @@ use crate::audio::PlayRequest;
 use crate::model::*;
 use crate::settings::{Corner, fmt_snooze};
 use crate::store::{NotifState, Store};
-use crate::views::TIMELINE_BG;
+use crate::views::{LINE_GAP, TIMELINE_BG};
 use crate::widgets::{
     ACTION_TEXT, Act, HEADLINE, TEXT, action_button, action_height, lerp_color, preset_button, preset_row,
     start_offset_labels, task_buttons,
@@ -26,8 +26,6 @@ const NOTIF_GAP: f32 = 15.0;
 const REMINDER_MARGIN_X: f32 = 14.0;
 /// Space above and below a reminder's content.
 const REMINDER_MARGIN_Y: f32 = 12.0;
-/// Space between the lines of a reminder.
-const REMINDER_LINE_GAP: f32 = 12.0;
 /// Width of the bar in the priority color along a reminder's left edge.
 const REMINDER_BAR_W: f32 = 10.0;
 /// How long after its start time a reminder reaches full red.
@@ -562,7 +560,7 @@ fn reminder_frame(ui: &mut Ui, fill: Color32, bar: Color32, add: impl FnOnce(&mu
             let bar_rect = egui::Rect::from_min_max(r.min, egui::pos2(r.left() + REMINDER_BAR_W, r.bottom()));
             ui.painter().rect_filled(bar_rect, 0.0, bar);
             // the same space between all lines
-            ui.spacing_mut().item_spacing.y = REMINDER_LINE_GAP;
+            ui.spacing_mut().item_spacing.y = LINE_GAP;
             let content = ui.vertical(add).response.rect;
             (content.bottom() + REMINDER_MARGIN_Y).ceil()
         })

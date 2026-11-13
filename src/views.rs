@@ -25,6 +25,8 @@ const ACCENT: Color32 = Color32::from_rgb(90, 140, 210);
 pub const TIMELINE_BG: Color32 = Color32::from_gray(26);
 /// Background of the day view, so also of the task rows that aren't given up.
 pub const DAY_BG: Color32 = Color32::from_gray(36);
+/// Space between the lines of a task in the list and of a reminder.
+pub const LINE_GAP: f32 = 12.0;
 
 pub fn elided(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<Galley> {
     let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
@@ -516,7 +518,7 @@ fn task_row(
         if done {
             ui.multiply_opacity(if failed { 0.8 } else { 0.5 });
         }
-        ui.spacing_mut().item_spacing.y = 5.0;
+        ui.spacing_mut().item_spacing.y = LINE_GAP;
         // title line, as high as its ✏ button whether that is shown or not
         let (chip, chip_color) = match e.status {
             EntryStatus::Virtual => ("planned", Color32::from_gray(160)),
