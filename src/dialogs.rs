@@ -20,7 +20,7 @@ use crate::widgets::{
 };
 
 /// Dragging a number field changes it by one step per this many points of mouse travel.
-pub const DRAG_POINTS_PER_STEP: f64 = 3.0;
+pub const DRAG_POINTS_PER_STEP: f64 = 8.0;
 
 // ============================================================================ editor
 
@@ -286,28 +286,92 @@ impl Sections {
     }
 }
 
-/// A number field with the control font.
-fn number<'a>(v: &'a mut u32, max: u32, steps_per_point: f64) -> egui::DragValue<'a> {
-    egui::DragValue::new(v).range(0..=max).speed(steps_per_point / DRAG_POINTS_PER_STEP)
-}
+/// The longest "notify ahead" time: 23 h 59 min.
+const MAX_NOTIFY_AHEAD_MIN: u32 = 23 * 60 + 59;
 
-/// Width of the number fields in the dialogs.
-const NUMBER_W: f32 = 130.0;
+/// Width of the hour and minute fields.
+const TIME_FIELD_W: f32 = 70.0;
+/// Width of the other number fields (the values of the sliders).
+const VALUE_FIELD_W: f32 = 130.0;
 
-/// Adds a number field ([`number`]): `NUMBER_W` wide, its value centered (while typing
-/// too), looking like an input field ([`input_style`]).
-fn number_field(ui: &mut Ui, field: egui::DragValue) -> egui::Response {
-    let size = egui::vec2(NUMBER_W, ctrl_h(ui));
+/// Adds a number field for `value` within `range`, `width` wide, its value centered (while
+/// typing too), looking like an input field ([`input_style`]). It changes by `step` per
+/// `DRAG_POINTS_PER_STEP` points of dragging and per press of ↑ / ↓ while it has the
+/// focus. `look` adds the rest (formatting, suffix, …).
+fn number_field<N: egui::emath::Numeric>(
+    ui: &mut Ui,
+    value: &mut N,
+    range: std::ops::RangeInclusive<N>,
+    step: f64,
+    width: f32,
+    look: impl FnOnce(egui::DragValue<'_>) -> egui::DragValue<'_>,
+) -> egui::Response {
+    let size = egui::vec2(width, ctrl_h(ui));
     // A number field being typed into aligns its text like the layout it is in.
     ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Center), |ui| {
         input_style(ui);
-        ui.add(field.min_size(size))
+        // egui changes a focused field by its drag speed per ↑ / ↓, which rounds away to
+        // nothing for whole numbers: handle them here (before the field sees them).
+        let id = ui.next_auto_id(); // the field's
+        let mut arrows = 0.0;
+        if ui.memory(|m| m.has_focus(id)) {
+            use egui::{Key, Modifiers};
+            arrows = ui.input_mut(|i| {
+                i.count_and_consume_key(Modifiers::NONE, Key::ArrowUp) as f64
+                    - i.count_and_consume_key(Modifiers::NONE, Key::ArrowDown) as f64
+            });
+            if arrows != 0.0 {
+                let (lo, hi) = (range.start().to_f64(), range.end().to_f64());
+                *value = N::from_f64((value.to_f64() + arrows * step).clamp(lo, hi));
+            }
+        }
+        let field = egui::DragValue::new(value).range(range).speed(step / DRAG_POINTS_PER_STEP);
+        let mut r = ui.add(look(field).min_size(size));
+        if arrows != 0.0 {
+            r.mark_changed();
+        }
+        r
     })
     .inner
 }
 
+/// What a pair of hour and minute fields stands for.
+#[derive(Clone, Copy, PartialEq)]
+enum TimeKind {
+    /// A time of day: "[hh] : [mm]".
+    OfDay,
+    /// A length of time: "[h] h [mm] min".
+    Span,
+}
+
+/// Hours (up to `max_h`) and minutes as two number fields, for a time of day or a length
+/// of time (`kind`).
+fn hm_fields(ui: &mut Ui, h: &mut u32, m: &mut u32, max_h: u32, kind: TimeKind) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        let a = number_field(ui, h, 0..=max_h, 1.0, TIME_FIELD_W, |f| {
+            if kind == TimeKind::OfDay { f.custom_formatter(two_digit) } else { f }
+        });
+        ui.label(if kind == TimeKind::OfDay { ":" } else { "h" });
+        let b = number_field(ui, m, 0..=59, 1.0, TIME_FIELD_W, |f| f.custom_formatter(two_digit));
+        if kind == TimeKind::Span {
+            ui.label("min");
+        }
+        a | b
+    })
+    .inner
+}
+
+/// [`hm_fields`] for a value in minutes.
+fn minutes_fields(ui: &mut Ui, v: &mut u32, max_h: u32, kind: TimeKind) -> egui::Response {
+    let (mut h, mut m) = (*v / 60, *v % 60);
+    let r = hm_fields(ui, &mut h, &mut m, max_h, kind);
+    *v = h * 60 + m;
+    r
+}
+
 /// Width of the settings dialog's content.
-const SETTINGS_W: f32 = 540.0;
+const SETTINGS_W: f32 = 550.0;
 
 /// Width of every slider in the dialogs.
 const SLIDER_W: f32 = 300.0;
@@ -317,12 +381,10 @@ fn percent_slider(ui: &mut Ui, v: &mut f32, label: &str) {
     ui.horizontal(|ui| {
         ui.spacing_mut().slider_width = SLIDER_W;
         ui.add(egui::Slider::new(&mut *v, 0.0..=1.0).show_value(false));
-        let field = egui::DragValue::new(v)
-            .range(0.0..=1.0)
-            .speed(0.01 / DRAG_POINTS_PER_STEP)
-            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-            .custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|p| p / 100.0));
-        number_field(ui, field);
+        number_field(ui, v, 0.0..=1.0, 0.01, VALUE_FIELD_W, |f| {
+            f.custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                .custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|p| p / 100.0))
+        });
         ui.label(label);
     });
 }
@@ -367,12 +429,7 @@ fn details_column(ui: &mut Ui, ed: &mut Editor, settings: &Settings) {
     });
 
     sec.add(ui, "Start time", |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            number_field(ui, number(&mut ed.start_h, 23, 1.0).custom_formatter(two_digit));
-            ui.label(":");
-            number_field(ui, number(&mut ed.start_m, 59, 0.5).custom_formatter(two_digit));
-        });
+        hm_fields(ui, &mut ed.start_h, &mut ed.start_m, 23, TimeKind::OfDay);
         presets(ui, |ui| {
             for &t in &settings.start_presets {
                 if chip(ui, ed.start_h * 60 + ed.start_m == t, fmt_hm(t)) {
@@ -384,10 +441,7 @@ fn details_column(ui: &mut Ui, ed: &mut Editor, settings: &Settings) {
     });
 
     sec.add(ui, "Estimate", |ui| {
-        ui.horizontal(|ui| {
-            number_field(ui, number(&mut ed.est_h, MAX_ESTIMATE_MIN / 60, 1.0).suffix(" h"));
-            number_field(ui, number(&mut ed.est_m, 59, 0.5).custom_formatter(two_digit).suffix(" min"));
-        });
+        hm_fields(ui, &mut ed.est_h, &mut ed.est_m, MAX_ESTIMATE_MIN / 60, TimeKind::Span);
         presets(ui, |ui| {
             for &m in &settings.time_presets {
                 if chip(ui, ed.est_h * 60 + ed.est_m == m, fmt_duration_min(m)) {
@@ -420,16 +474,17 @@ fn details_column(ui: &mut Ui, ed: &mut Editor, settings: &Settings) {
 
     sec.add(ui, "Notify ahead", |ui| {
         ui.horizontal(|ui| {
-            number_field(ui, duration_field(&mut ed.notify_ahead, 0))
-                .on_hover_text("A short silent notice this many minutes before the start; closes after 10 s");
-            if ed.notify_ahead > 0 {
-                ui.label(RichText::new("before the start").weak());
-            }
+            minutes_fields(ui, &mut ed.notify_ahead, MAX_NOTIFY_AHEAD_MIN / 60, TimeKind::Span)
+                .on_hover_text("A short silent notice this long before the start; closes after 10 s");
+            let note = if ed.notify_ahead > 0 { "before the start" } else { "(off)" };
+            ui.label(RichText::new(note).weak());
         });
         presets(ui, |ui| {
             // "Off" always comes first; the others are set in the settings
             for m in std::iter::once(0).chain(settings.time_presets.iter().copied()) {
                 let label = if m == 0 { "Off".to_string() } else { fmt_duration_min(m) };
+                // "24 h" is as far ahead as it goes: 23:59
+                let m = m.min(MAX_NOTIFY_AHEAD_MIN);
                 if chip(ui, ed.notify_ahead == m, label) {
                     ed.notify_ahead = m;
                 }
@@ -1046,16 +1101,17 @@ impl SettingsDialog {
     }
 }
 
-/// Settings for a list of preset values (minutes): a pill per value that removes it, a
-/// field for a new one (`field`, editing `new`) with an Add button, and a button that
-/// restores the `defaults`. `label` is how a value is shown.
+/// Settings for a list of preset values (minutes, up to `max`): a pill per value that
+/// removes it, hour and minute fields for a new one (`new`, a time of day or a length of
+/// time: `kind`) with an Add button, and a button that restores the `defaults`. `label`
+/// is how a value is shown.
 fn preset_list(
     ui: &mut Ui,
     list: &mut Vec<u32>,
     new: &mut u32,
+    (max, kind): (u32, TimeKind),
     defaults: &[u32],
     label: impl Fn(u32) -> String,
-    field: impl FnOnce(&mut u32) -> egui::DragValue<'_>,
 ) {
     preset_row(ui, |ui| {
         let mut remove = None;
@@ -1077,7 +1133,8 @@ fn preset_list(
             ui.style_mut().text_styles.insert(style, FontId::proportional(ACTION_TEXT));
         }
         ui.spacing_mut().button_padding = ACTION_PAD_SYM;
-        number_field(ui, field(new));
+        minutes_fields(ui, new, max / 60, kind);
+        *new = (*new).min(max);
         if action_button(ui, "Add", Act::Plain, true).clicked() && !list.contains(new) {
             list.push(*new);
             list.sort_unstable();
@@ -1086,91 +1143,6 @@ fn preset_list(
             *list = defaults.to_vec();
         }
     });
-}
-
-/// A field for a time of day in minutes, shown and typed as "HH:MM" (or just the hour).
-fn time_of_day_field(v: &mut u32) -> egui::DragValue<'_> {
-    egui::DragValue::new(v)
-        .range(0..=24 * 60 - 1)
-        .speed(5.0 / DRAG_POINTS_PER_STEP)
-        .custom_formatter(|v, _| fmt_hm(v.round() as u32))
-        .custom_parser(parse_hm)
-}
-
-/// "9", "9:30", "09:30", "930", "0930" → minutes of the day.
-fn parse_hm(s: &str) -> Option<f64> {
-    let s = s.trim();
-    let (h, m) = match s.split_once(':') {
-        Some((h, m)) => (h.trim(), m.trim()),
-        // without a colon: up to two digits are the hour, more end in the minutes
-        None if s.len() > 2 && s.is_ascii() => s.split_at(s.len() - 2),
-        None => (s, "0"),
-    };
-    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
-    (h < 24 && m < 60).then_some((h * 60 + m) as f64)
-}
-
-/// A field for a duration in minutes (time presets, "notify ahead" time) from `min` up to
-/// `MAX_DURATION_MIN`, shown like "1 h 30 min" ([`fmt_duration_field`]; "Off" for 0). It goes in minutes up to
-/// an hour and in quarter hours above, when dragged and when typed.
-fn duration_field(v: &mut u32, min: u32) -> egui::DragValue<'_> {
-    egui::DragValue::from_get_set(move |step| {
-        if let Some(step) = step {
-            *v = step_to_duration(step);
-        }
-        duration_to_step(*v)
-    })
-    .range(duration_to_step(min)..=duration_to_step(MAX_DURATION_MIN))
-    .speed(1.0 / DRAG_POINTS_PER_STEP)
-    .custom_formatter(|step, _| match step_to_duration(step) {
-        0 => "Off".into(),
-        m => fmt_duration_field(m),
-    })
-    .custom_parser(|s| {
-        let m = if s.trim().eq_ignore_ascii_case("off") { 0 } else { parse_duration(s)? };
-        Some(duration_to_step(m.min(MAX_DURATION_MIN)))
-    })
-}
-
-/// A duration as a duration field shows it: always hours and two-digit minutes
-/// ("0 h 05 min", "2 h 00 min"), so the text keeps its length while dragging.
-fn fmt_duration_field(min: u32) -> String {
-    format!("{} h {:02} min", min / 60, min % 60)
-}
-
-/// A duration field's steps: one per minute below an hour, one per quarter hour above.
-fn duration_to_step(min: u32) -> f64 {
-    if min < 60 { min as f64 } else { 60.0 + ((min - 60) as f64 / 15.0).round() }
-}
-
-fn step_to_duration(step: f64) -> u32 {
-    let step = step.round().max(0.0) as u32;
-    if step < 60 { step } else { 60 + (step - 60) * 15 }
-}
-
-/// A typed duration in minutes: "90", "90 min", "2 h", "1h 30", "1 h 30 min".
-fn parse_duration(s: &str) -> Option<u32> {
-    let s = s.trim().to_lowercase();
-    let mut chars = s.chars().peekable();
-    let (mut total, mut num, mut any) = (0u32, None::<u32>, false);
-    while let Some(c) = chars.next() {
-        if let Some(d) = c.to_digit(10) {
-            num = Some(num.unwrap_or(0).checked_mul(10)?.checked_add(d)?);
-            any = true;
-        } else if c == 'h' {
-            total = total.checked_add(num.take()?.checked_mul(60)?)?;
-        } else if c == 'm' {
-            total = total.checked_add(num.take()?)?;
-            // "min", "mins"
-            while chars.peek().is_some_and(|c| c.is_alphabetic()) {
-                chars.next();
-            }
-        } else if !c.is_whitespace() {
-            return None;
-        }
-    }
-    // a number without a unit: minutes
-    any.then(|| total.checked_add(num.unwrap_or(0))).flatten()
 }
 
 pub enum SettingsResult {
@@ -1219,11 +1191,12 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                 });
 
                 sections.add(ui, "Start time presets", |ui| {
-                    preset_list(ui, &mut s.start_presets, &mut dlg.new_start, &DEFAULT_START_PRESETS, fmt_hm, time_of_day_field);
+                    let of_day = (24 * 60 - 1, TimeKind::OfDay);
+                    preset_list(ui, &mut s.start_presets, &mut dlg.new_start, of_day, &DEFAULT_START_PRESETS, fmt_hm);
                 });
 
                 sections.add(ui, "Time presets", |ui| {
-                    preset_list(ui, &mut s.time_presets, &mut dlg.new_time, &DEFAULT_TIME_PRESETS, fmt_duration_min, |v| duration_field(v, 1));
+                    preset_list(ui, &mut s.time_presets, &mut dlg.new_time, (MAX_DURATION_MIN, TimeKind::Span), &DEFAULT_TIME_PRESETS, fmt_duration_min);
                 });
 
                 sections.add(ui, "Sound", |ui| {
@@ -1261,8 +1234,7 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     ui.horizontal(|ui| {
                         ui.spacing_mut().slider_width = SLIDER_W;
                         ui.add(egui::Slider::new(&mut s.ramp_secs, 0.0..=300.0).show_value(false));
-                        let secs = egui::DragValue::new(&mut s.ramp_secs).range(0.0..=300.0).speed(1.0 / DRAG_POINTS_PER_STEP).max_decimals(0).suffix(" s");
-                        number_field(ui, secs);
+                        number_field(ui, &mut s.ramp_secs, 0.0..=300.0, 1.0, VALUE_FIELD_W, |f| f.max_decimals(0).suffix(" s"));
                         ui.label("ramp time");
                     });
                     ui.horizontal(|ui| {
@@ -1282,8 +1254,7 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     ui.horizontal(|ui| {
                         ui.spacing_mut().slider_width = SLIDER_W;
                         let slider = ui.add(egui::Slider::new(&mut dlg.scale_pct, UI_SCALE_PCT).logarithmic(true).show_value(false));
-                        let field = egui::DragValue::new(&mut dlg.scale_pct).range(UI_SCALE_PCT).speed(1.0 / DRAG_POINTS_PER_STEP).suffix(" %");
-                        let r = slider | number_field(ui, field);
+                        let r = slider | number_field(ui, &mut dlg.scale_pct, UI_SCALE_PCT, 1.0, VALUE_FIELD_W, |f| f.suffix(" %"));
                         // Rescaling while dragging would move the slider away under the mouse,
                         // so the preview is applied on release (or after typing a value).
                         if (r.changed() && !r.dragged()) || r.drag_stopped() {
@@ -1341,45 +1312,6 @@ mod tests {
         let mut ed = Editor::new(d(11, 6));
         ed.title = title.into();
         ed
-    }
-
-    #[test]
-    fn times_of_day_are_parsed() {
-        assert_eq!(parse_hm("9"), Some(540.0));
-        assert_eq!(parse_hm(" 09:30 "), Some(570.0));
-        assert_eq!(parse_hm("23:59"), Some(1439.0));
-        assert_eq!(parse_hm("930"), Some(570.0));
-        assert_eq!(parse_hm("1030"), Some(630.0));
-        assert_eq!(parse_hm("2400"), None);
-        assert_eq!(parse_hm("24:00"), None);
-        assert_eq!(parse_hm("9:60"), None);
-        assert_eq!(parse_hm("x"), None);
-    }
-
-    #[test]
-    fn durations_are_parsed() {
-        assert_eq!(parse_duration("90"), Some(90));
-        assert_eq!(parse_duration(" 90 min "), Some(90));
-        assert_eq!(parse_duration("2 h"), Some(120));
-        assert_eq!(parse_duration("1h 30"), Some(90));
-        assert_eq!(parse_duration("1 h 30 min"), Some(90));
-        assert_eq!(parse_duration("24h"), Some(1440));
-        assert_eq!(parse_duration(""), None);
-        assert_eq!(parse_duration("h"), None);
-        assert_eq!(parse_duration("1.5 h"), None);
-        // what the field shows can be typed back
-        for m in [5, 60, 90, 1440] {
-            assert_eq!(step_to_duration(duration_to_step(m)), m, "{m} min is a step");
-        }
-        assert_eq!(duration_to_step(59), 59.0);
-        assert_eq!(duration_to_step(75), 61.0, "quarter hours above an hour");
-        assert_eq!(step_to_duration(duration_to_step(70)), 75, "rounded to a quarter hour");
-        for m in [5, 60, 90, 1440] {
-            assert_eq!(parse_duration(&fmt_duration_min(m)), Some(m));
-            assert_eq!(parse_duration(&fmt_duration_field(m)), Some(m));
-        }
-        assert_eq!(fmt_duration_field(5), "0 h 05 min");
-        assert_eq!(fmt_duration_field(120), "2 h 00 min");
     }
 
     #[test]

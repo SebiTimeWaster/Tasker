@@ -92,9 +92,10 @@ pub fn clamp_scale(f: f32) -> f32 {
 /// The snooze times a due reminder offers (minutes).
 pub const SNOOZE_MINUTES: [u32; 5] = [5, 10, 30, 60, 120];
 
-pub const DEFAULT_START_PRESETS: [u32; 7] = [7 * 60, 8 * 60, 9 * 60, 12 * 60, 14 * 60, 18 * 60, 20 * 60];
+/// 08:00 to 20:00 every two hours.
+pub const DEFAULT_START_PRESETS: [u32; 7] = [8 * 60, 10 * 60, 12 * 60, 14 * 60, 16 * 60, 18 * 60, 20 * 60];
 pub const DEFAULT_TIME_PRESETS: [u32; 8] = [5, 15, 30, 60, 2 * 60, 4 * 60, 8 * 60, 24 * 60];
-/// The longest "notify ahead" time and time preset (minutes).
+/// The longest time preset (minutes).
 pub const MAX_DURATION_MIN: u32 = 24 * 60;
 
 impl Default for Settings {
