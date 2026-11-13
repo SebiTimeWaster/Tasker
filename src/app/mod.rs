@@ -395,7 +395,7 @@ impl eframe::App for TaskerApp {
             }
         }
         if let Some(ed) = &mut self.editor {
-            match dialogs::editor_ui(&ctx, ed) {
+            match dialogs::editor_ui(&ctx, ed, &self.settings) {
                 EditorResult::Open => {}
                 EditorResult::Cancel => self.editor = None,
                 EditorResult::Save(task) => {

@@ -10,7 +10,7 @@ use super::{TaskerApp, minute_of_day, now_ts};
 use crate::action::Action;
 use crate::audio::PlayRequest;
 use crate::model::*;
-use crate::settings::{Corner, fmt_snooze};
+use crate::settings::{Corner, SNOOZE_MINUTES, fmt_snooze};
 use crate::store::{NotifState, Store};
 use crate::views::{LINE_GAP, TIMELINE_BG};
 use crate::widgets::{
@@ -63,7 +63,8 @@ impl NotifKind {
     }
 
     /// Window height to open with, before the content has been measured (which
-    /// corrects it in the next frame): due reminders have the extra snooze row.
+    /// corrects it in the next frame): due reminders have the extra snooze row (unless
+    /// they were snoozed before).
     fn height_guess(&self) -> f32 {
         if matches!(self, NotifKind::Due { .. }) { 182.0 } else { 150.0 }
     }
@@ -475,11 +476,13 @@ impl TaskerApp {
                     }
                 }
             });
-            if let NotifKind::Due { .. } = kind {
+            // A reminder can be snoozed once: when it comes back, it has to be dealt with.
+            let snoozed_before = self.store.notif(&kind.key()).snooze_until.is_some();
+            if matches!(kind, NotifKind::Due { .. }) && !snoozed_before {
                 ui.add_enabled_ui(done.is_none(), |ui| {
                     preset_row(ui, |ui| {
                         ui.label(RichText::new("Snooze").color(Color32::from_gray(210)));
-                        for &m in &self.settings.snooze_minutes {
+                        for m in SNOOZE_MINUTES {
                             if preset_button(ui, false, fmt_snooze(m)).clicked() {
                                 out = Some(NotifAction::Snooze(m));
                             }

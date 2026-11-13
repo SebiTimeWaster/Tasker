@@ -32,7 +32,11 @@ impl SoundChoice {
 #[serde(default)]
 pub struct Settings {
     pub corner: Corner,
-    pub snooze_minutes: Vec<u32>,
+    /// Preset buttons for a task's start time in the editor (minutes of the day).
+    pub start_presets: Vec<u32>,
+    /// Preset buttons for a task's estimate and its "notify ahead" time in the editor
+    /// (minutes); for "notify ahead" an "Off" button comes before them anyway.
+    pub time_presets: Vec<u32>,
     pub sound: SoundChoice,
     pub sound_file: String,
     /// Seconds to ramp from `start_volume` to `end_volume`.
@@ -85,13 +89,20 @@ pub fn clamp_scale(f: f32) -> f32 {
     if f.is_finite() { f.clamp(lo, hi) } else { 1.0 }
 }
 
-pub const DEFAULT_SNOOZE: [u32; 5] = [5, 10, 30, 60, 120];
+/// The snooze times a due reminder offers (minutes).
+pub const SNOOZE_MINUTES: [u32; 5] = [5, 10, 30, 60, 120];
+
+pub const DEFAULT_START_PRESETS: [u32; 7] = [7 * 60, 8 * 60, 9 * 60, 12 * 60, 14 * 60, 18 * 60, 20 * 60];
+pub const DEFAULT_TIME_PRESETS: [u32; 8] = [5, 15, 30, 60, 2 * 60, 4 * 60, 8 * 60, 24 * 60];
+/// The longest "notify ahead" time and time preset (minutes).
+pub const MAX_DURATION_MIN: u32 = 24 * 60;
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             corner: Corner::BottomRight,
-            snooze_minutes: DEFAULT_SNOOZE.to_vec(),
+            start_presets: DEFAULT_START_PRESETS.to_vec(),
+            time_presets: DEFAULT_TIME_PRESETS.to_vec(),
             sound: SoundChoice::Chime,
             sound_file: String::new(),
             ramp_secs: 30.0,
@@ -140,9 +151,11 @@ mod tests {
     #[test]
     fn older_settings_still_load() {
         // Saved by an older version: fields added later get their defaults.
+        // (snooze_minutes is no longer a setting and is ignored)
         let s: Settings = serde_json::from_str(r#"{"corner":"TopLeft","snooze_minutes":[15],"sound":"Bell"}"#).unwrap();
         assert_eq!(s.corner, Corner::TopLeft);
-        assert_eq!(s.snooze_minutes, [15]);
+        assert_eq!(s.start_presets, DEFAULT_START_PRESETS);
+        assert_eq!(s.time_presets, DEFAULT_TIME_PRESETS);
         assert_eq!(s.sound, SoundChoice::Bell);
         assert_eq!(s.ui_scale, 1.0);
         assert_eq!(s.ramp_secs, Settings::default().ramp_secs);

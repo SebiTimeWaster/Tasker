@@ -90,30 +90,31 @@ fn paint_button(ui: &mut Ui, text: RichText, look: Look) -> egui::Response {
     );
     let size = (galley.size() + look.pad.sum()).max(look.min_size);
     let Look { pad, radius, fill, selected, enabled, .. } = look;
-    ui.scope(|ui| {
+    // Allocated in `ui` itself (no child ui), so that a wrapping row (`preset_row`) can
+    // move the button to the next line. A disabled one only reacts to hovering (tooltips).
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    response.widget_info(|| {
+        let mut info = egui::WidgetInfo::labeled(egui::Role::Button, enabled, &label);
+        info.selected = selected;
+        info
+    });
+    if ui.is_rect_visible(rect) {
+        let on = selected.unwrap_or(false);
+        let v = ui.style().interact_selectable(&response, on);
+        let bg = fill.filter(|_| !on).unwrap_or(v.weak_bg_fill);
+        let frame = rect.expand(v.expansion);
+        let mut painter = ui.painter().clone();
         if !enabled {
-            ui.disable();
+            painter.multiply_opacity(ui.visuals().disabled_alpha());
         }
-        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-        response.widget_info(|| {
-            let mut info = egui::WidgetInfo::labeled(egui::Role::Button, enabled, &label);
-            info.selected = selected;
-            info
-        });
-        if ui.is_rect_visible(rect) {
-            let on = selected.unwrap_or(false);
-            let v = ui.style().interact_selectable(&response, on);
-            let bg = fill.filter(|_| !on).unwrap_or(v.weak_bg_fill);
-            let frame = rect.expand(v.expansion);
-            ui.painter().rect(frame, CornerRadius::same(radius), bg, v.bg_stroke, egui::StrokeKind::Inside);
-            // Centered horizontally; vertically centered with the extra room below the text.
-            let extra = (size - galley.size() - pad.sum()) / 2.0;
-            let pos = egui::pos2(rect.center().x - galley.size().x / 2.0, rect.top() + pad.top as f32 + extra.y);
-            ui.painter().galley(pos, galley, v.text_color());
-        }
-        response
-    })
-    .inner
+        painter.rect(frame, CornerRadius::same(radius), bg, v.bg_stroke, egui::StrokeKind::Inside);
+        // Centered horizontally; vertically centered with the extra room below the text.
+        let extra = (size - galley.size() - pad.sum()) / 2.0;
+        let pos = egui::pos2(rect.center().x - galley.size().x / 2.0, rect.top() + pad.top as f32 + extra.y);
+        painter.galley(pos, galley, v.text_color());
+    }
+    response
 }
 
 /// An action button (see above). Disabled buttons are shown dimmed.

@@ -357,17 +357,24 @@ impl Store {
     /// planned time reaches past midnight (they are on both days). Sorted by start time.
     pub fn entries_shown_on(&self, date: NaiveDate, now: i64) -> Vec<Entry> {
         let mut out = self.entries_for(date, now);
-        if let Some(before) = date.pred_opt() {
-            out.extend(self.entries_for(before, now).into_iter().filter(Entry::crosses_midnight));
-            sort_for_day(&mut out, date);
+        for days in 1..=MAX_DAYS_REACHED {
+            if let Some(before) = date.checked_sub_days(chrono::Days::new(days as u64)) {
+                out.extend(self.entries_for(before, now).into_iter().filter(|e| e.reaches_day_after(days)));
+            }
         }
+        sort_for_day(&mut out, date);
         out
     }
 
     /// Number of entries [`Store::entries_shown_on`] would return, without building them.
     pub fn count_shown_on(&self, date: NaiveDate) -> usize {
-        let from_before = |start_min: u32, estimate_min: u32| start_min + estimate_min > DAY_MIN;
-        self.count_where(date, |_, _| true) + date.pred_opt().map_or(0, |before| self.count_where(before, from_before))
+        let mut n = self.count_where(date, |_, _| true);
+        for days in 1..=MAX_DAYS_REACHED {
+            if let Some(before) = date.checked_sub_days(chrono::Days::new(days as u64)) {
+                n += self.count_where(before, |start, estimate| start + estimate > days * DAY_MIN);
+            }
+        }
+        n
     }
 
     /// How many entries of `date` have a (start, estimate) that `keep` accepts.
@@ -955,6 +962,17 @@ mod tests {
         s.save_task(test_task("Late", Schedule::Date { date: day(11, 5), repeat: Repeat::Never }, 23 * 60, 60))
             .unwrap();
         assert_eq!((s.count_shown_on(day(11, 5)), s.count_shown_on(day(11, 6))), (1, 0));
+
+        // the longest estimates reach two days further
+        let mut s = Store::open(Path::new(":memory:")).unwrap();
+        s.save_task(test_task("Trip", Schedule::Date { date: day(11, 5), repeat: Repeat::Never }, 23 * 60, 47 * 60))
+            .unwrap();
+        for (d, span) in [(5, (23 * 60, 24 * 60)), (6, (0, 24 * 60)), (7, (0, 22 * 60))] {
+            let e = s.entries_shown_on(day(11, d), 0);
+            assert_eq!((e.len(), e[0].span_on(day(11, d))), (1, span), "day {d}");
+            assert_eq!(s.count_shown_on(day(11, d)), 1, "count on day {d}");
+        }
+        assert_eq!((s.entries_shown_on(day(11, 8), 0).len(), s.count_shown_on(day(11, 8))), (0, 0));
     }
 
     #[test]

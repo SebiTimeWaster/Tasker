@@ -9,7 +9,9 @@ use crate::app::GRID_LINE;
 use crate::audio::Audio;
 use crate::model::*;
 use crate::platform;
-use crate::settings::{Corner, DEFAULT_SNOOZE, Settings, SoundChoice, UI_SCALE_PCT, fmt_snooze};
+use crate::settings::{
+    Corner, DEFAULT_START_PRESETS, DEFAULT_TIME_PRESETS, MAX_DURATION_MIN, Settings, SoundChoice, UI_SCALE_PCT,
+};
 use crate::store::Store;
 use crate::views::{month_grid, month_header};
 use crate::widgets::{
@@ -183,7 +185,7 @@ impl Editor {
             notes: self.notes.clone(),
             schedule,
             start_min: self.start_h * 60 + self.start_m,
-            estimate_min: self.est_h * 60 + self.est_m,
+            estimate_min: (self.est_h * 60 + self.est_m).min(MAX_ESTIMATE_MIN),
             priority: self.priority,
             notify: self.notify,
             notify_ahead_min: self.notify_ahead,
@@ -290,7 +292,7 @@ fn number<'a>(v: &'a mut u32, max: u32, steps_per_point: f64) -> egui::DragValue
 }
 
 /// Width of the number fields in the dialogs.
-const NUMBER_W: f32 = 100.0;
+const NUMBER_W: f32 = 130.0;
 
 /// Adds a number field ([`number`]): `NUMBER_W` wide, its value centered (while typing
 /// too), looking like an input field ([`input_style`]).
@@ -303,6 +305,9 @@ fn number_field(ui: &mut Ui, field: egui::DragValue) -> egui::Response {
     })
     .inner
 }
+
+/// Width of the settings dialog's content.
+const SETTINGS_W: f32 = 540.0;
 
 /// Width of every slider in the dialogs.
 const SLIDER_W: f32 = 300.0;
@@ -339,7 +344,7 @@ fn input_style(ui: &mut Ui) {
     }
 }
 
-fn details_column(ui: &mut Ui, ed: &mut Editor) {
+fn details_column(ui: &mut Ui, ed: &mut Editor, settings: &Settings) {
     let field_w = LEFT_FIELD_W;
     let mut sec = Sections::default();
     sec.add(ui, "Title", |ui| {
@@ -369,10 +374,10 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
             number_field(ui, number(&mut ed.start_m, 59, 0.5).custom_formatter(two_digit));
         });
         presets(ui, |ui| {
-            for h in [7u32, 8, 9, 12, 14, 18, 20] {
-                if chip(ui, ed.start_h == h && ed.start_m == 0, format!("{h:02}:00")) {
-                    ed.start_h = h;
-                    ed.start_m = 0;
+            for &t in &settings.start_presets {
+                if chip(ui, ed.start_h * 60 + ed.start_m == t, fmt_hm(t)) {
+                    ed.start_h = t / 60;
+                    ed.start_m = t % 60;
                 }
             }
         });
@@ -380,11 +385,11 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
 
     sec.add(ui, "Estimate", |ui| {
         ui.horizontal(|ui| {
-            number_field(ui, number(&mut ed.est_h, 23, 1.0).suffix(" h"));
-            number_field(ui, number(&mut ed.est_m, 59, 0.5).suffix(" min"));
+            number_field(ui, number(&mut ed.est_h, MAX_ESTIMATE_MIN / 60, 1.0).suffix(" h"));
+            number_field(ui, number(&mut ed.est_m, 59, 0.5).custom_formatter(two_digit).suffix(" min"));
         });
         presets(ui, |ui| {
-            for m in [5u32, 15, 30, 45, 60, 90, 120] {
+            for &m in &settings.time_presets {
                 if chip(ui, ed.est_h * 60 + ed.est_m == m, fmt_duration_min(m)) {
                     ed.est_h = m / 60;
                     ed.est_m = m % 60;
@@ -415,22 +420,15 @@ fn details_column(ui: &mut Ui, ed: &mut Editor) {
 
     sec.add(ui, "Notify ahead", |ui| {
         ui.horizontal(|ui| {
-            number_field(
-                ui,
-                number(&mut ed.notify_ahead, 240, 1.0)
-                    .custom_formatter(|v, _| if v < 0.5 { "Off".into() } else { format!("{v:.0} min") })
-                    .custom_parser(|s| {
-                        let s = s.trim().trim_end_matches("min").trim();
-                        if s.eq_ignore_ascii_case("off") { Some(0.0) } else { s.parse().ok() }
-                    }),
-            )
-            .on_hover_text("A short silent notice this many minutes before the start; closes after 10 s");
+            number_field(ui, duration_field(&mut ed.notify_ahead, 0))
+                .on_hover_text("A short silent notice this many minutes before the start; closes after 10 s");
             if ed.notify_ahead > 0 {
                 ui.label(RichText::new("before the start").weak());
             }
         });
         presets(ui, |ui| {
-            for m in [0u32, 5, 10, 15, 30, 60] {
+            // "Off" always comes first; the others are set in the settings
+            for m in std::iter::once(0).chain(settings.time_presets.iter().copied()) {
                 let label = if m == 0 { "Off".to_string() } else { fmt_duration_min(m) };
                 if chip(ui, ed.notify_ahead == m, label) {
                     ed.notify_ahead = m;
@@ -564,7 +562,7 @@ fn schedule_column(ui: &mut Ui, ed: &mut Editor) {
     sec.finish(ui);
 }
 
-pub fn editor_ui(ctx: &egui::Context, ed: &mut Editor) -> EditorResult {
+pub fn editor_ui(ctx: &egui::Context, ed: &mut Editor, settings: &Settings) -> EditorResult {
     let mut result = EditorResult::Open;
     // Anchored at the top so a taller schedule only extends the dialog downwards.
     let top = ((ctx.content_rect().height() - 700.0) / 2.0).max(10.0);
@@ -585,7 +583,7 @@ pub fn editor_ui(ctx: &egui::Context, ed: &mut Editor) -> EditorResult {
             for style in [TextStyle::Body, TextStyle::Button, TextStyle::Monospace] {
                 ui.style_mut().text_styles.insert(style, FontId::proportional(CTRL_SIZE));
             }
-            let left = ui.vertical(|ui| details_column(ui, ed)).response.rect;
+            let left = ui.vertical(|ui| details_column(ui, ed, settings)).response.rect;
             ui.add_space(28.0);
             ui.vertical(|ui| {
                 ui.set_min_height(ed.schedule_h);
@@ -737,7 +735,7 @@ pub fn task_list_ui(ctx: &egui::Context, store: &Store) -> ListResult {
     let today = Local::now().date_naive();
     let screen = ctx.content_rect().size();
     let span = |t: &Task| {
-        format!("{}   ·   est. {}", fmt_time_span(t.start_min, t.estimate_min, false), fmt_duration_min(t.estimate_min))
+        format!("{}   ·   est. {}", fmt_time_span(t.start_min, t.estimate_min, 0), fmt_duration_min(t.estimate_min))
     };
     let section = |ui: &mut Ui, title: &str, n: usize| {
         ui.horizontal(|ui| {
@@ -1020,7 +1018,9 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
 pub struct SettingsDialog {
     draft: Settings,
     browse_result: Arc<Mutex<Option<String>>>,
-    new_snooze: u32,
+    /// The values in the fields for adding a preset.
+    new_start: u32,
+    new_time: u32,
     /// UI scale slider value in percent (applied to `draft` on release).
     scale_pct: u32,
 }
@@ -1028,7 +1028,13 @@ pub struct SettingsDialog {
 impl SettingsDialog {
     pub fn new(s: Settings) -> Self {
         let scale_pct = (s.ui_scale * 100.0).round() as u32;
-        SettingsDialog { draft: s, browse_result: Arc::new(Mutex::new(None)), new_snooze: 15, scale_pct }
+        SettingsDialog {
+            draft: s,
+            browse_result: Arc::new(Mutex::new(None)),
+            new_start: 10 * 60,
+            new_time: 20,
+            scale_pct,
+        }
     }
     /// The UI scale being previewed.
     pub fn ui_scale(&self) -> f32 {
@@ -1038,6 +1044,133 @@ impl SettingsDialog {
         self.draft.ui_scale = f;
         self.scale_pct = (f * 100.0).round() as u32;
     }
+}
+
+/// Settings for a list of preset values (minutes): a pill per value that removes it, a
+/// field for a new one (`field`, editing `new`) with an Add button, and a button that
+/// restores the `defaults`. `label` is how a value is shown.
+fn preset_list(
+    ui: &mut Ui,
+    list: &mut Vec<u32>,
+    new: &mut u32,
+    defaults: &[u32],
+    label: impl Fn(u32) -> String,
+    field: impl FnOnce(&mut u32) -> egui::DragValue<'_>,
+) {
+    preset_row(ui, |ui| {
+        let mut remove = None;
+        for (i, &v) in list.iter().enumerate() {
+            if preset_button(ui, false, format!("{}  ✕", label(v))).on_hover_text("Remove").clicked() {
+                remove = Some(i);
+            }
+        }
+        if let Some(i) = remove {
+            list.remove(i);
+        }
+        if list.is_empty() {
+            ui.label(RichText::new("none").weak());
+        }
+    });
+    ui.horizontal(|ui| {
+        // as big as the Add button next to it
+        for style in [TextStyle::Button, TextStyle::Body] {
+            ui.style_mut().text_styles.insert(style, FontId::proportional(ACTION_TEXT));
+        }
+        ui.spacing_mut().button_padding = ACTION_PAD_SYM;
+        number_field(ui, field(new));
+        if action_button(ui, "Add", Act::Plain, true).clicked() && !list.contains(new) {
+            list.push(*new);
+            list.sort_unstable();
+        }
+        if preset_button(ui, list == defaults, "Defaults").clicked() {
+            *list = defaults.to_vec();
+        }
+    });
+}
+
+/// A field for a time of day in minutes, shown and typed as "HH:MM" (or just the hour).
+fn time_of_day_field(v: &mut u32) -> egui::DragValue<'_> {
+    egui::DragValue::new(v)
+        .range(0..=24 * 60 - 1)
+        .speed(5.0 / DRAG_POINTS_PER_STEP)
+        .custom_formatter(|v, _| fmt_hm(v.round() as u32))
+        .custom_parser(parse_hm)
+}
+
+/// "9", "9:30", "09:30", "930", "0930" → minutes of the day.
+fn parse_hm(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (h, m) = match s.split_once(':') {
+        Some((h, m)) => (h.trim(), m.trim()),
+        // without a colon: up to two digits are the hour, more end in the minutes
+        None if s.len() > 2 && s.is_ascii() => s.split_at(s.len() - 2),
+        None => (s, "0"),
+    };
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    (h < 24 && m < 60).then_some((h * 60 + m) as f64)
+}
+
+/// A field for a duration in minutes (time presets, "notify ahead" time) from `min` up to
+/// `MAX_DURATION_MIN`, shown like "1 h 30 min" ([`fmt_duration_field`]; "Off" for 0). It goes in minutes up to
+/// an hour and in quarter hours above, when dragged and when typed.
+fn duration_field(v: &mut u32, min: u32) -> egui::DragValue<'_> {
+    egui::DragValue::from_get_set(move |step| {
+        if let Some(step) = step {
+            *v = step_to_duration(step);
+        }
+        duration_to_step(*v)
+    })
+    .range(duration_to_step(min)..=duration_to_step(MAX_DURATION_MIN))
+    .speed(1.0 / DRAG_POINTS_PER_STEP)
+    .custom_formatter(|step, _| match step_to_duration(step) {
+        0 => "Off".into(),
+        m => fmt_duration_field(m),
+    })
+    .custom_parser(|s| {
+        let m = if s.trim().eq_ignore_ascii_case("off") { 0 } else { parse_duration(s)? };
+        Some(duration_to_step(m.min(MAX_DURATION_MIN)))
+    })
+}
+
+/// A duration as a duration field shows it: always hours and two-digit minutes
+/// ("0 h 05 min", "2 h 00 min"), so the text keeps its length while dragging.
+fn fmt_duration_field(min: u32) -> String {
+    format!("{} h {:02} min", min / 60, min % 60)
+}
+
+/// A duration field's steps: one per minute below an hour, one per quarter hour above.
+fn duration_to_step(min: u32) -> f64 {
+    if min < 60 { min as f64 } else { 60.0 + ((min - 60) as f64 / 15.0).round() }
+}
+
+fn step_to_duration(step: f64) -> u32 {
+    let step = step.round().max(0.0) as u32;
+    if step < 60 { step } else { 60 + (step - 60) * 15 }
+}
+
+/// A typed duration in minutes: "90", "90 min", "2 h", "1h 30", "1 h 30 min".
+fn parse_duration(s: &str) -> Option<u32> {
+    let s = s.trim().to_lowercase();
+    let mut chars = s.chars().peekable();
+    let (mut total, mut num, mut any) = (0u32, None::<u32>, false);
+    while let Some(c) = chars.next() {
+        if let Some(d) = c.to_digit(10) {
+            num = Some(num.unwrap_or(0).checked_mul(10)?.checked_add(d)?);
+            any = true;
+        } else if c == 'h' {
+            total = total.checked_add(num.take()?.checked_mul(60)?)?;
+        } else if c == 'm' {
+            total = total.checked_add(num.take()?)?;
+            // "min", "mins"
+            while chars.peek().is_some_and(|c| c.is_alphabetic()) {
+                chars.next();
+            }
+        } else if !c.is_whitespace() {
+            return None;
+        }
+    }
+    // a number without a unit: minutes
+    any.then(|| total.checked_add(num.unwrap_or(0))).flatten()
 }
 
 pub enum SettingsResult {
@@ -1061,9 +1194,10 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
     let modal = Modal::new(Id::unique("settings")).frame(dialog_frame(ctx)).show(ctx, |ui| {
         ui.heading("⚙ Settings");
         ui.add_space(6.0);
-        // As wide as the content needs; only the height is limited (vertical scrolling).
+        // A fixed width (longer preset lists wrap); only the height is limited (vertical scrolling).
         egui::ScrollArea::vertical().max_height((screen.y - 150.0).max(80.0)).show(ui, |ui| {
             ui.vertical(|ui| {
+                ui.set_width(SETTINGS_W);
                 let mut sections = Sections::default();
                 sections.add(ui, "Notification corner", |ui| {
                     let corners = [
@@ -1084,33 +1218,12 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     });
                 });
 
-                sections.add(ui, "Snooze options", |ui| {
-                    preset_row(ui, |ui| {
-                        let mut remove = None;
-                        for (i, m) in s.snooze_minutes.iter().enumerate() {
-                            if preset_button(ui, false, format!("{}  ✕", fmt_snooze(*m))).on_hover_text("Remove").clicked() {
-                                remove = Some(i);
-                            }
-                        }
-                        if let Some(i) = remove {
-                            s.snooze_minutes.remove(i);
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        // as big as the Add button next to it
-                        for style in [egui::TextStyle::Button, egui::TextStyle::Body] {
-                            ui.style_mut().text_styles.insert(style, FontId::proportional(ACTION_TEXT));
-                        }
-                        ui.spacing_mut().button_padding = ACTION_PAD_SYM;
-                        number_field(ui, egui::DragValue::new(&mut dlg.new_snooze).range(1..=24 * 60).speed(1.0 / DRAG_POINTS_PER_STEP).suffix(" min"));
-                        if action_button(ui, "Add", Act::Plain, true).clicked() && !s.snooze_minutes.contains(&dlg.new_snooze) {
-                            s.snooze_minutes.push(dlg.new_snooze);
-                            s.snooze_minutes.sort_unstable();
-                        }
-                        if preset_button(ui, s.snooze_minutes == DEFAULT_SNOOZE, "Defaults").clicked() {
-                            s.snooze_minutes = DEFAULT_SNOOZE.to_vec();
-                        }
-                    });
+                sections.add(ui, "Start time presets", |ui| {
+                    preset_list(ui, &mut s.start_presets, &mut dlg.new_start, &DEFAULT_START_PRESETS, fmt_hm, time_of_day_field);
+                });
+
+                sections.add(ui, "Time presets", |ui| {
+                    preset_list(ui, &mut s.time_presets, &mut dlg.new_time, &DEFAULT_TIME_PRESETS, fmt_duration_min, |v| duration_field(v, 1));
                 });
 
                 sections.add(ui, "Sound", |ui| {
@@ -1228,6 +1341,45 @@ mod tests {
         let mut ed = Editor::new(d(11, 6));
         ed.title = title.into();
         ed
+    }
+
+    #[test]
+    fn times_of_day_are_parsed() {
+        assert_eq!(parse_hm("9"), Some(540.0));
+        assert_eq!(parse_hm(" 09:30 "), Some(570.0));
+        assert_eq!(parse_hm("23:59"), Some(1439.0));
+        assert_eq!(parse_hm("930"), Some(570.0));
+        assert_eq!(parse_hm("1030"), Some(630.0));
+        assert_eq!(parse_hm("2400"), None);
+        assert_eq!(parse_hm("24:00"), None);
+        assert_eq!(parse_hm("9:60"), None);
+        assert_eq!(parse_hm("x"), None);
+    }
+
+    #[test]
+    fn durations_are_parsed() {
+        assert_eq!(parse_duration("90"), Some(90));
+        assert_eq!(parse_duration(" 90 min "), Some(90));
+        assert_eq!(parse_duration("2 h"), Some(120));
+        assert_eq!(parse_duration("1h 30"), Some(90));
+        assert_eq!(parse_duration("1 h 30 min"), Some(90));
+        assert_eq!(parse_duration("24h"), Some(1440));
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("h"), None);
+        assert_eq!(parse_duration("1.5 h"), None);
+        // what the field shows can be typed back
+        for m in [5, 60, 90, 1440] {
+            assert_eq!(step_to_duration(duration_to_step(m)), m, "{m} min is a step");
+        }
+        assert_eq!(duration_to_step(59), 59.0);
+        assert_eq!(duration_to_step(75), 61.0, "quarter hours above an hour");
+        assert_eq!(step_to_duration(duration_to_step(70)), 75, "rounded to a quarter hour");
+        for m in [5, 60, 90, 1440] {
+            assert_eq!(parse_duration(&fmt_duration_min(m)), Some(m));
+            assert_eq!(parse_duration(&fmt_duration_field(m)), Some(m));
+        }
+        assert_eq!(fmt_duration_field(5), "0 h 05 min");
+        assert_eq!(fmt_duration_field(120), "2 h 00 min");
     }
 
     #[test]
