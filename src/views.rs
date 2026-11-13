@@ -178,6 +178,8 @@ fn next_task(entries: &[Entry], date: NaiveDate) -> Option<&Entry> {
 }
 
 fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
+    /// Space from a row's top edge to the day's name and from the second line to its bottom edge.
+    const ROW_PAD: f32 = 6.0;
     let monday = monday_of(app.selected);
     let row_h = rect.height() / 7.0;
     let now = now_ts();
@@ -206,7 +208,7 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
         let name_col = if d == today { Color32::from_rgb(240, 200, 90) } else { Color32::from_gray(230) };
         let x = r.left() + 8.0;
         p.text(
-            egui::pos2(x, r.top() + 6.0),
+            egui::pos2(x, r.top() + ROW_PAD),
             Align2::LEFT_TOP,
             WEEKDAY_LONG[i as usize],
             FontId::proportional(big),
@@ -214,7 +216,7 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
         );
         p.text(
             // on the name's baseline
-            egui::pos2(x + name_w + 10.0, r.top() + 6.0 + (big - TEXT) * 0.8),
+            egui::pos2(x + name_w + 10.0, r.top() + ROW_PAD + (big - TEXT) * 0.8),
             Align2::LEFT_TOP,
             d.format("%d.%m.").to_string(),
             FontId::proportional(TEXT),
@@ -224,13 +226,12 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
         let done = entries.iter().filter(|e| e.status == EntryStatus::Done).count();
         let failed = entries.iter().filter(|e| e.status == EntryStatus::Failed).count();
         let (green, red) = (Color32::from_rgb(110, 170, 120), Color32::from_rgb(215, 95, 85));
-        // On the line of the day's name (not the row's center, which is lower than the
-        // name in rows without a second line).
+        // the number of tasks, vertically centered in the row
         p.text(
-            egui::pos2(r.right() - 10.0, r.top() + 6.0 + big * 0.6),
+            egui::pos2(r.right() - 10.0, r.center().y),
             Align2::RIGHT_CENTER,
             total.to_string(),
-            FontId::proportional((row_h * 0.38).clamp(16.0, 24.0)),
+            FontId::proportional(22.0),
             if total == 0 {
                 Color32::from_gray(90)
             } else if done == total {
@@ -241,19 +242,23 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
                 Color32::WHITE
             },
         );
+        // The second line sits as far above the row's bottom edge as the name sits below its
+        // top edge, if there is room for it below the name.
+        let second_line = |h: f32| Some(r.bottom() - ROW_PAD - h).filter(|&y| y >= r.top() + ROW_PAD + big);
         if let Some(e) = next_task(&entries, d) {
             let txt = format!("{}  {}", fmt_hm(e.start_min), e.title);
             let g = elided(ui, &txt, FontId::proportional(TEXT), Color32::from_gray(160), r.width() - 60.0);
-            let y = r.top() + 8.0 + big + 4.0;
-            if y + TEXT < r.bottom() {
-                p.circle_filled(egui::pos2(x + 3.0, y + 7.0), 3.0, e.priority.color());
+            if let Some(y) = second_line(g.size().y) {
+                p.circle_filled(egui::pos2(x + 3.0, y + g.size().y / 2.0), 3.0, e.priority.color());
                 p.galley(egui::pos2(x + 11.0, y), g, Color32::from_gray(160));
             }
         } else if total > 0 {
-            let y = r.top() + 8.0 + big + 4.0;
             let (text, color) =
                 if failed == 0 { ("all done ✔".to_string(), green) } else { (format!("{failed} failed ✖"), red) };
-            p.text(egui::pos2(x, y), Align2::LEFT_TOP, text, FontId::proportional(TEXT), color);
+            let g = ui.fonts_mut(|f| f.layout_no_wrap(text, FontId::proportional(TEXT), color));
+            if let Some(y) = second_line(g.size().y) {
+                p.galley(egui::pos2(x, y), g, color);
+            }
         }
         p.hline(rect.x_range(), r.bottom(), Stroke::new(1.0, GRID_LINE));
         if resp.clicked() {
