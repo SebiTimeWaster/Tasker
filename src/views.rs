@@ -21,6 +21,8 @@ use crate::widgets::{
 };
 
 const ACCENT: Color32 = Color32::from_rgb(90, 140, 210);
+/// Background of the hour timeline (and of the reminder windows).
+pub const TIMELINE_BG: Color32 = Color32::from_gray(26);
 
 pub fn elided(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<Galley> {
     let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
@@ -260,6 +262,8 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
 // ============================================================================ day view
 
 const TIMELINE_W: f32 = 64.0;
+/// Width of the stripe in the priority color on the left of each task.
+const PRIORITY_STRIPE_W: f32 = 6.0;
 const CONNECTOR_W: f32 = 70.0;
 const HEADER_H: f32 = 44.0;
 
@@ -361,7 +365,7 @@ fn minute_y(tl: Rect, min: u32) -> f32 {
 /// midnight, the part that lies on this day.
 fn timeline(ui: &Ui, tl: Rect, entries: &[Entry], day: NaiveDate) {
     let p = ui.painter_at(tl.expand2(egui::vec2(0.0, 1.0)));
-    p.rect_filled(tl, 0.0, Color32::from_gray(26));
+    p.rect_filled(tl, 0.0, TIMELINE_BG);
     let hour_h = tl.height() / 24.0;
     let label_every = if hour_h >= 16.0 {
         1
@@ -484,7 +488,8 @@ fn task_row(
     let failed = e.status == EntryStatus::Failed;
     let done = e.status.is_closed();
     let fill = if failed { FAILED_RED } else { Color32::TRANSPARENT };
-    let margin = Margin { left: 16, right: 12, top: 9, bottom: 10 };
+    // the priority stripe plus 12 px to the text
+    let margin = Margin { left: PRIORITY_STRIPE_W as i8 + 12, right: 12, top: 9, bottom: 10 };
     let resp = Frame::new().fill(fill).inner_margin(margin).show(ui, |ui| {
         ui.set_width(ui.available_width());
         if done {
@@ -621,7 +626,7 @@ fn task_row(
     });
     let r = resp.response.rect;
     ui.painter().rect_filled(
-        Rect::from_min_size(r.min, egui::vec2(4.0, r.height())),
+        Rect::from_min_size(r.min, egui::vec2(PRIORITY_STRIPE_W, r.height())),
         0.0,
         e.priority.color().gamma_multiply(if done { 0.4 } else { 1.0 }),
     );
