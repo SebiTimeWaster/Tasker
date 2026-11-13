@@ -140,6 +140,7 @@ pub fn month_grid(
         if let Some(counts) = counts {
             let n = counts(d);
             if n > 0 {
+                // One dot per entry, up to four; five and more merge them into one bar.
                 let dots = n.min(4);
                 let dot_col = if d == *selected {
                     Color32::WHITE
@@ -149,9 +150,15 @@ pub fn month_grid(
                     Color32::from_gray(90)
                 };
                 let total_w = dots as f32 * 6.0 - 2.0;
-                for k in 0..dots {
-                    let x = r.center().x - total_w / 2.0 + k as f32 * 6.0 + 2.0;
-                    p.circle_filled(egui::pos2(x, r.bottom() - 6.0), 2.0, dot_col);
+                let y = r.bottom() - 6.0;
+                let left = r.center().x - total_w / 2.0;
+                if n >= 5 {
+                    let bar = Rect::from_min_max(egui::pos2(left, y - 2.0), egui::pos2(left + total_w, y + 2.0));
+                    p.rect_filled(bar, 2.0, dot_col);
+                } else {
+                    for k in 0..dots {
+                        p.circle_filled(egui::pos2(left + k as f32 * 6.0 + 2.0, y), 2.0, dot_col);
+                    }
                 }
             }
         }
