@@ -83,6 +83,7 @@ data lives in `%APPDATA%\tasker\tasker.db` and the log in `%LOCALAPPDATA%\tasker
 
 ## To do
 
+* **Add pictures**: to the readme.
 * **Reminder monitor**: choose which monitor shows the reminders (they are always on the
   primary one now), next to the corner setting.
 * **Uniform wording**: list every visible text with its place and settle on one term each
