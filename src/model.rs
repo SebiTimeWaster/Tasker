@@ -347,6 +347,8 @@ impl EntryStatus {
 pub const DAY_MIN: u32 = 24 * 60;
 /// The longest estimate: just under two days.
 pub const MAX_ESTIMATE_MIN: u32 = 48 * 60 - 1;
+/// The longest "notify ahead" time: just under a day.
+pub const MAX_NOTIFY_AHEAD_MIN: u32 = DAY_MIN - 1;
 /// How many days after its own day an entry can still reach (a late start plus the
 /// longest estimate); those days show it too.
 pub const MAX_DAYS_REACHED: u32 = 2;

@@ -7,7 +7,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use chrono::{Duration, NaiveDate};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::model::*;
 use crate::settings::Settings;
@@ -116,6 +117,74 @@ fn migrate(conn: &Connection) -> Res<()> {
     Ok(())
 }
 
+/// Reads the numbers of one row leniently: a damaged value (not a number, or outside what
+/// the app can use) is replaced and written to the log instead of failing the whole load.
+/// One bad row must not keep the app from starting.
+struct Cols<'a, 'r> {
+    row: &'a Row<'r>,
+    /// Which row, for the log: "task 3", "run 12" …
+    what: String,
+}
+
+impl Cols<'_, '_> {
+    fn damaged(&self, col: &str, value: &dyn std::fmt::Debug, using: &dyn std::fmt::Display) {
+        crate::logfile::error(format!("{}: unusable {col} {value:?}; using {using}", self.what));
+    }
+
+    /// The raw value of column `i`, as something to show in the log.
+    fn raw(&self, i: usize) -> String {
+        match self.row.get_ref(i) {
+            Ok(ValueRef::Null) => "NULL".into(),
+            Ok(ValueRef::Integer(v)) => v.to_string(),
+            Ok(ValueRef::Real(v)) => v.to_string(),
+            Ok(ValueRef::Text(t)) => String::from_utf8_lossy(t).into_owned(),
+            Ok(ValueRef::Blob(b)) => format!("<{} bytes>", b.len()),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// An integer, None if the column holds anything else.
+    fn integer(&self, i: usize) -> Option<i64> {
+        match self.row.get_ref(i) {
+            Ok(ValueRef::Integer(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Column `i` (`col`) as an integer, or `default`.
+    fn int(&self, i: usize, col: &str, default: i64) -> i64 {
+        self.integer(i).unwrap_or_else(|| {
+            self.damaged(col, &self.raw(i), &default);
+            default
+        })
+    }
+
+    /// A column that may be empty (NULL): an integer, or None.
+    fn opt_int(&self, i: usize, col: &str) -> Option<i64> {
+        match self.row.get_ref(i) {
+            Ok(ValueRef::Null) => None,
+            Ok(ValueRef::Integer(v)) => Some(v),
+            _ => {
+                self.damaged(col, &self.raw(i), &"nothing");
+                None
+            }
+        }
+    }
+
+    /// A number of minutes (or similar) in `0..=max`: one outside is limited to that range.
+    fn minutes(&self, i: usize, col: &str, max: u32, default: u32) -> u32 {
+        let Some(v) = self.integer(i) else {
+            self.damaged(col, &self.raw(i), &default);
+            return default;
+        };
+        let ok = v.clamp(0, max as i64) as u32;
+        if ok as i64 != v {
+            self.damaged(col, &v, &ok);
+        }
+        ok
+    }
+}
+
 /// Order of the entries shown on `day`: by start time (one carried over from the day
 /// before comes first), then the more important one, then by title.
 fn sort_for_day(entries: &mut [Entry], day: NaiveDate) {
@@ -153,18 +222,20 @@ impl Store {
                     ));
                     Schedule::Date { date: chrono::Local::now().date_naive(), repeat: Repeat::Never }
                 });
+                let c = Cols { row: r, what: format!("task {id} \"{title}\"") };
                 Ok(Task {
                     id,
                     title,
                     notes: r.get(2)?,
                     schedule: schedule.normalized(),
-                    start_min: r.get(4)?,
-                    estimate_min: r.get(5)?,
-                    priority: Priority::from_i64(r.get(6)?),
-                    notify: NotifyMode::from_i64(r.get(7)?),
-                    created_at: r.get(8)?,
-                    deleted: r.get::<_, i64>(9)? != 0,
-                    notify_ahead_min: r.get(10)?,
+                    start_min: c.minutes(4, "start time", DAY_MIN - 1, 9 * 60),
+                    estimate_min: c.minutes(5, "estimate", MAX_ESTIMATE_MIN, 30),
+                    priority: Priority::from_i64(c.int(6, "priority", Priority::Normal as i64)),
+                    // a damaged reminder setting keeps the reminder: that is what Tasker is for
+                    notify: NotifyMode::from_i64(c.int(7, "reminder", NotifyMode::Sound as i64)),
+                    created_at: c.int(8, "creation time", 0),
+                    deleted: c.int(9, "deleted flag", 0) != 0,
+                    notify_ahead_min: c.minutes(10, "notify ahead time", MAX_NOTIFY_AHEAD_MIN, 0),
                 })
             })?
             .collect::<Res<_>>()?;
@@ -172,11 +243,28 @@ impl Store {
 
         let mut segs: HashMap<i64, Vec<Segment>> = HashMap::new();
         let mut st = self.conn.prepare("SELECT id,run_id,start,end FROM segments ORDER BY start")?;
-        for row in st
-            .query_map([], |r| Ok((r.get::<_, i64>(1)?, Segment { id: r.get(0)?, start: r.get(2)?, end: r.get(3)? })))?
-        {
-            let (run_id, seg) = row?;
-            segs.entry(run_id).or_default().push(seg);
+        for row in st.query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let c = Cols { row: r, what: format!("time segment {id}") };
+            // Without a start the segment's time is unknown: leave it out (a made-up start
+            // could add years of tracked time). A damaged end closes it where it began.
+            let Some(start) = c.integer(2) else {
+                c.damaged("start", &c.raw(2), &"nothing (segment left out)");
+                return Ok(None);
+            };
+            let end = match r.get_ref(3)? {
+                ValueRef::Null => None,
+                ValueRef::Integer(v) => Some(v),
+                _ => {
+                    c.damaged("end", &c.raw(3), &"its start");
+                    Some(start)
+                }
+            };
+            Ok(c.integer(1).map(|run_id| (run_id, Segment { id, start, end })))
+        })? {
+            if let Some((run_id, seg)) = row? {
+                segs.entry(run_id).or_default().push(seg);
+            }
         }
         drop(st);
 
@@ -192,21 +280,29 @@ impl Store {
                     crate::logfile::error(format!("run {id}: unreadable date {date:?} ({e}); filed under 1970-01-01"));
                     NaiveDate::default()
                 });
+                let c = Cols { row: r, what: format!("run {id}") };
+                let added_secs = c.int(13, "added time", 0);
                 Ok(Run {
                     id,
-                    task_id: r.get(1)?,
+                    // 0 is no task's id: the run is kept, as one of a deleted task
+                    task_id: c.int(1, "task", 0),
                     date,
                     title: r.get(3)?,
                     notes: r.get(4)?,
-                    start_min: r.get(5)?,
-                    estimate_min: r.get(6)?,
-                    priority: Priority::from_i64(r.get(7)?),
-                    notify: NotifyMode::from_i64(r.get(8)?),
-                    recurring: r.get::<_, i64>(9)? != 0,
-                    status: RunStatus::from_i64(r.get(10)?),
-                    created_at: r.get(11)?,
-                    finished_at: r.get(12)?,
-                    added_secs: r.get(13)?,
+                    start_min: c.minutes(5, "start time", DAY_MIN - 1, 9 * 60),
+                    estimate_min: c.minutes(6, "estimate", MAX_ESTIMATE_MIN, 30),
+                    priority: Priority::from_i64(c.int(7, "priority", Priority::Normal as i64)),
+                    notify: NotifyMode::from_i64(c.int(8, "reminder", NotifyMode::Sound as i64)),
+                    recurring: c.int(9, "recurring flag", 0) != 0,
+                    status: RunStatus::from_i64(c.int(10, "status", RunStatus::Paused as i64)),
+                    created_at: c.int(11, "creation time", 0),
+                    finished_at: c.opt_int(12, "finish time"),
+                    added_secs: if added_secs < 0 {
+                        c.damaged("added time", &added_secs, &0);
+                        0
+                    } else {
+                        added_secs
+                    },
                     segments: segs.remove(&id).unwrap_or_default(),
                 })
             })?
@@ -218,10 +314,14 @@ impl Store {
         let mut st = self.conn.prepare("SELECT key,dismissed,snooze_until FROM notif_state")?;
         self.notif_state = st
             .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    NotifState { dismissed: r.get::<_, i64>(1)? != 0, snooze_until: r.get(2)? },
-                ))
+                let key: String = r.get(0)?;
+                let c = Cols { row: r, what: format!("reminder state {key:?}") };
+                // damaged: not dismissed. A reminder too many is better than a lost one.
+                let st = NotifState {
+                    dismissed: c.int(1, "dismissed flag", 0) != 0,
+                    snooze_until: c.opt_int(2, "snooze time"),
+                };
+                Ok((key, st))
             })?
             .collect::<Res<_>>()?;
         Ok(())
@@ -238,6 +338,8 @@ impl Store {
             .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
             .map(|mut s| {
                 s.ui_scale = crate::settings::clamp_scale(s.ui_scale);
+                let close = crate::settings::AHEAD_CLOSE_SECS;
+                s.ahead_close_secs = s.ahead_close_secs.clamp(*close.start(), *close.end());
                 s
             })
             .unwrap_or_default()
@@ -739,6 +841,56 @@ mod tests {
     }
 
     #[test]
+    fn damaged_numbers_still_load() {
+        let path = temp_db("numbers");
+        let (a, b) = {
+            let mut s = Store::open(&path).unwrap();
+            let once = Schedule::Date { date: day(11, 5), repeat: Repeat::Never };
+            let a = s.save_task(test_task("A", once.clone(), 600, 30)).unwrap();
+            let b = s.save_task(test_task("B", once, 700, 30)).unwrap();
+            let run = s.start(a, day(11, 5), 1_000).unwrap();
+            s.pause(run, 1_600).unwrap();
+            s.resume(run, 2_000).unwrap();
+            s.pause(run, 2_300).unwrap();
+            s.resume(run, 3_000).unwrap();
+            s.set_notif("due:2:2026-11-05", NotifState { dismissed: true, snooze_until: None }).unwrap();
+            // Values the app never writes: out of range, or not numbers at all (SQLite
+            // keeps text that doesn't look like a number as text, even in an INTEGER column).
+            s.conn
+                .execute_batch(&format!(
+                    "UPDATE tasks SET start_min=-5, estimate_min=999999, notify_ahead='soon', priority='high' WHERE id={a};
+                     UPDATE tasks SET start_min=99999, notify='loud', created_at=1.5, deleted='no' WHERE id={b};
+                     UPDATE runs SET added_secs=-100, estimate_min='long', finished_at='later' WHERE id={run};
+                     UPDATE segments SET end='then' WHERE start=1000;
+                     UPDATE segments SET start='once' WHERE start=2000;
+                     UPDATE notif_state SET dismissed='maybe', snooze_until='soon';"
+                ))
+                .unwrap();
+            (a, b)
+        };
+        let s = Store::open(&path).expect("damaged numbers don't keep the app from starting");
+        let ta = s.task(a).unwrap();
+        assert_eq!((ta.start_min, ta.estimate_min, ta.notify_ahead_min), (0, MAX_ESTIMATE_MIN, 0), "limited");
+        assert_eq!(ta.priority, Priority::Normal);
+        let tb = s.task(b).expect("not deleted");
+        assert_eq!(
+            (tb.start_min, tb.notify, tb.created_at),
+            (DAY_MIN - 1, NotifyMode::Sound, 0),
+            "a reminder stays on"
+        );
+        let r = s.runs_of(a).next().unwrap();
+        assert_eq!((r.added_secs, r.estimate_min, r.finished_at, r.status), (0, 30, None, RunStatus::Running));
+        // the first segment ends where it began, the one without a start is left out, the
+        // running one goes on
+        assert_eq!(r.segments.len(), 2);
+        assert_eq!(r.tracked_secs(3_100), 100);
+        assert!(!s.notif("due:2:2026-11-05").dismissed, "the reminder comes back rather than being lost");
+        assert_eq!(s.notif("due:2:2026-11-05").snooze_until, None);
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn settings_roundtrip() {
         use crate::settings::{Corner, SoundChoice};
         let path = temp_db("settings");
@@ -762,9 +914,11 @@ mod tests {
             (Corner::TopLeft, SoundChoice::File, "/home/me/alarm.ogg")
         );
         assert_eq!((set.time_presets.as_slice(), set.ui_scale), (&[10, 20][..], 1.5));
-        // a UI scale from outside the allowed range is limited
-        s.save_settings(&Settings { ui_scale: 9.0, ..set }).unwrap();
-        assert_eq!(s.load_settings().ui_scale, 2.0);
+        // values from outside the allowed ranges are limited
+        s.save_settings(&Settings { ui_scale: 9.0, ahead_close_secs: 0, ..set.clone() }).unwrap();
+        assert_eq!((s.load_settings().ui_scale, s.load_settings().ahead_close_secs), (2.0, 1));
+        s.save_settings(&Settings { ahead_close_secs: 100_000, ..set }).unwrap();
+        assert_eq!(s.load_settings().ahead_close_secs, 300);
         // settings that can't be read: the defaults, instead of not starting
         s.conn.execute("UPDATE settings SET value='not json' WHERE key='settings'", []).unwrap();
         assert_eq!(s.load_settings(), Settings::default());

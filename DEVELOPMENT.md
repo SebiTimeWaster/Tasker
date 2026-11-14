@@ -92,6 +92,8 @@ data lives in `%APPDATA%\tasker\tasker.db` and the log in `%LOCALAPPDATA%\tasker
 * **i18n**: translations; the texts are English only. Best done after the uniform wording,
   moving the texts into a translation library (e.g. `rust-i18n` or Fluent).
 * **Distro packaging**: packages for Linux distributions (e.g. .deb, Flatpak, AUR).
+* **GitHub workflows**: for pull requests, issues and releases (CI already builds the
+  binaries on every push; a release workflow would publish them).
 
 ## Concepts
 
@@ -215,7 +217,7 @@ Tasker can start minimized there (`--minimized` does the same once).
 | `src/tray.rs`, `src/icon.rs` | Panel icon contents (color, tooltip, menu), generated icon |
 | `src/platform/`   | Everything OS-specific, as `linux/` and `windows/` with the same names: screen work areas (X11 / Win32), panel icon (D-Bus / notification area), single instance (Unix socket / localhost port), sound output (ALSA / waveOut), file chooser (zenity, kdialog / Windows dialog) |
 | `build.rs`, `assets/tasker.ico` | Windows: icon and version info in the .exe |
-| `.github/workflows/ci.yml` | CI: formatting, lints, tests and the release binaries on every push |
+| `.github/workflows/ci.yml` | CI: formatting, lints, tests, dependency audit and the release binaries on every push |
 
 ## Tests
 
@@ -224,6 +226,7 @@ cargo test                  # schedules, store, reminders, editor, statistics, s
 cargo test --release frame_queries -- --ignored --nocapture   # per-frame cost with 3 years of history
 cargo clippy --all-targets -- -D warnings                      # lints
 cargo fmt                                                      # formatting (rustfmt.toml)
+cargo audit                                                    # known vulnerabilities in the dependencies
 ```
 
 Most modules have tests at the bottom. The reminder logic (`wanted_reminders` in

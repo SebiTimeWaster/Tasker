@@ -298,9 +298,6 @@ impl Sections {
     }
 }
 
-/// The longest "notify ahead" time: 23 h 59 min.
-const MAX_NOTIFY_AHEAD_MIN: u32 = 23 * 60 + 59;
-
 /// Width of the hour and minute fields.
 const TIME_FIELD_W: f32 = 70.0;
 /// Width of the other number fields (the values of the sliders).

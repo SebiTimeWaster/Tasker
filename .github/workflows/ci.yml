@@ -1,6 +1,8 @@
 # Runs on every push to main and on pull requests:
 #   check: formatting, lints (for the Linux and the Windows code), tests, and tasker.exe
 #   linux: the Linux binary, built on AlmaLinux 9 so that glibc 2.34 is enough to run it
+#   audit: the dependencies in Cargo.lock against the RustSec advisory database (fails on
+#          known vulnerabilities; "unmaintained" and "unsound" warnings are only listed)
 # Both binaries can be downloaded from the run's page (Artifacts).
 name: CI
 
@@ -55,3 +57,12 @@ jobs:
         with:
           name: tasker-linux
           path: target/release/tasker
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
