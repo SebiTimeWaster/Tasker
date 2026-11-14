@@ -1239,6 +1239,49 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
             ui.vertical(|ui| {
                 ui.set_width(SETTINGS_W);
                 let mut sections = Sections::default();
+                sections.add(ui, "UI scale", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().slider_width = SLIDER_W;
+                        let slider = ui.add(egui::Slider::new(&mut dlg.scale_pct, UI_SCALE_PCT).logarithmic(true).show_value(false));
+                        let r = slider | number_field(ui, &mut dlg.scale_pct, UI_SCALE_PCT, 1.0, VALUE_FIELD_W, |f| f.suffix(" %"));
+                        // Rescaling while dragging would move the slider away under the mouse,
+                        // so the preview is applied on release (or after typing a value).
+                        if (r.changed() && !r.dragged()) || r.drag_stopped() {
+                            s.ui_scale = dlg.scale_pct as f32 / 100.0;
+                        }
+                    });
+                    preset_row(ui, |ui| {
+                        for pct in [80u32, 100, 125, 150, 200] {
+                            if preset_button(ui, dlg.scale_pct == pct, format!("{pct} %")).clicked() {
+                                dlg.scale_pct = pct;
+                                s.ui_scale = pct as f32 / 100.0;
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Applied when you release the slider; click the number to type a value.\nKeyboard Shortcuts: Ctrl + / Ctrl − / Ctrl 0.")
+                            .weak(),
+                    );
+                });
+
+                sections.add(ui, "Window", |ui| {
+                    ui.checkbox(&mut s.close_to_tray, "Close button minimizes to the panel instead of quitting");
+                    ui.checkbox(&mut s.start_minimized, "Start minimized to the panel (or start with --minimized)");
+                });
+
+                sections.add(ui, "New task defaults", |ui| {
+                    new_task_defaults(ui, &mut s.new_task);
+                });
+
+                sections.add(ui, "Start time presets", |ui| {
+                    let of_day = (24 * 60 - 1, TimeKind::OfDay);
+                    preset_list(ui, &mut s.start_presets, &mut dlg.new_start, of_day, &DEFAULT_START_PRESETS, fmt_hm);
+                });
+
+                sections.add(ui, "Time presets", |ui| {
+                    preset_list(ui, &mut s.time_presets, &mut dlg.new_time, (MAX_DURATION_MIN, TimeKind::Span), &DEFAULT_TIME_PRESETS, fmt_duration_min);
+                });
+
                 sections.add(ui, "Notification corner", |ui| {
                     let corners = [
                         (Corner::TopLeft, "↖ Top left"),
@@ -1271,19 +1314,6 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     if radio(ui, s.ahead_stays, "Stays until dismissed").clicked() {
                         s.ahead_stays = true;
                     }
-                });
-
-                sections.add(ui, "New task defaults", |ui| {
-                    new_task_defaults(ui, &mut s.new_task);
-                });
-
-                sections.add(ui, "Start time presets", |ui| {
-                    let of_day = (24 * 60 - 1, TimeKind::OfDay);
-                    preset_list(ui, &mut s.start_presets, &mut dlg.new_start, of_day, &DEFAULT_START_PRESETS, fmt_hm);
-                });
-
-                sections.add(ui, "Time presets", |ui| {
-                    preset_list(ui, &mut s.time_presets, &mut dlg.new_time, (MAX_DURATION_MIN, TimeKind::Span), &DEFAULT_TIME_PRESETS, fmt_duration_min);
                 });
 
                 sections.add(ui, "Sound", |ui| {
@@ -1335,36 +1365,6 @@ pub fn settings_ui(ctx: &egui::Context, dlg: &mut SettingsDialog, audio: &Audio)
                     if let Some(err) = audio.error() {
                         ui.colored_label(Color32::from_rgb(240, 130, 100), format!("⚠ {err}"));
                     }
-                });
-
-                sections.add(ui, "UI scale", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().slider_width = SLIDER_W;
-                        let slider = ui.add(egui::Slider::new(&mut dlg.scale_pct, UI_SCALE_PCT).logarithmic(true).show_value(false));
-                        let r = slider | number_field(ui, &mut dlg.scale_pct, UI_SCALE_PCT, 1.0, VALUE_FIELD_W, |f| f.suffix(" %"));
-                        // Rescaling while dragging would move the slider away under the mouse,
-                        // so the preview is applied on release (or after typing a value).
-                        if (r.changed() && !r.dragged()) || r.drag_stopped() {
-                            s.ui_scale = dlg.scale_pct as f32 / 100.0;
-                        }
-                    });
-                    preset_row(ui, |ui| {
-                        for pct in [80u32, 100, 125, 150, 200] {
-                            if preset_button(ui, dlg.scale_pct == pct, format!("{pct} %")).clicked() {
-                                dlg.scale_pct = pct;
-                                s.ui_scale = pct as f32 / 100.0;
-                            }
-                        }
-                    });
-                    ui.label(
-                        RichText::new("Applied when you release the slider; click the number to type a value.\nKeyboard Shortcuts: Ctrl + / Ctrl − / Ctrl 0.")
-                            .weak(),
-                    );
-                });
-
-                sections.add(ui, "Window", |ui| {
-                    ui.checkbox(&mut s.close_to_tray, "Close button minimizes to the panel instead of quitting");
-                    ui.checkbox(&mut s.start_minimized, "Start minimized to the panel (or start with --minimized)");
                 });
                 sections.finish(ui);
             });

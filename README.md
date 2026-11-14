@@ -225,5 +225,10 @@ In VS Code, Ctrl+Shift+B runs `cargo build --release`; "Tasks: Run Task" also of
 
 * **Reminder monitor**: choose which monitor shows the reminders (they are always on the
   primary one now), next to the corner setting.
-* **i18n**: translations; the texts are English only.
+* **Uniform wording**: list every visible text with its place and settle on one term each
+  (e.g. reminder / notification / notice / announcement, "Off" / "(off)", estimate /
+  "est.", given up / failed). The texts are string literals where they are used, mostly in
+  `dialogs.rs`, `app/reminders.rs`, `views.rs`, `widgets.rs`, `model.rs` and `tray.rs`.
+* **i18n**: translations; the texts are English only. Best done after the uniform wording,
+  moving the texts into a translation library (e.g. `rust-i18n` or Fluent).
 * **Distro packaging**: packages for Linux distributions (e.g. .deb, Flatpak, AUR).
