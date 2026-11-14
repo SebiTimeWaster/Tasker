@@ -25,6 +25,18 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// Create `dir` (and its parents) for Tasker's own files. On Unix only this user may
+/// open it: tasks, notes and the log are nobody else's business, and home directories
+/// are often readable by everyone. An existing directory is made private too.
+pub fn create_private_dir(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
 /// x, y, width, height in physical pixels.
 pub type Area = (i32, i32, i32, i32);
 
@@ -35,5 +47,24 @@ fn instance_name(ext: &str) -> String {
     match std::env::var("TASKER_DB") {
         Ok(db) => format!("tasker-{:x}.{ext}", db.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64))),
         Err(_) => format!("tasker.{ext}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn private_dirs() {
+        let dir = std::env::temp_dir().join(format!("tasker-private-{}", std::process::id())).join("tasker");
+        super::create_private_dir(&dir);
+        assert!(dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            super::create_private_dir(&dir);
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "an existing directory is made private");
+        }
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

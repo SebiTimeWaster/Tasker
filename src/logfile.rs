@@ -26,7 +26,7 @@ pub fn path() -> PathBuf {
 pub fn init() {
     let path = path();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        crate::platform::create_private_dir(dir);
     }
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_SIZE) {
         let _ = std::fs::rename(&path, path.with_extension("log.1"));

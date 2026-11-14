@@ -47,7 +47,8 @@ present on a normal desktop install.
 
 Data lives in `~/.local/share/tasker/tasker.db` (SQLite; Windows: see below). To back it up, copy that file while
 Tasker isn't running (while it runs, recent changes may still be in `tasker.db-wal`). Reminder
-state (dismissed/snoozed) older than a week is cleaned up at startup.
+state (dismissed/snoozed) older than a week is cleaned up at startup. On Linux the `tasker`
+folders for the data and the log are made readable by their owner only (mode 700).
 
 A log (start/exit, errors, reminder events, crashes with backtrace) is written to
 `~/.local/state/tasker/tasker.log` (moved to `tasker.log.1` at startup once it exceeds 1 MB). Release builds keep line tables, so
@@ -219,7 +220,7 @@ Tasker can start minimized there (`--minimized` does the same once).
 ## Tests
 
 ```sh
-cargo test                  # schedules, store, reminders, editor, statistics, settings, tray
+cargo test                  # schedules, store, reminders, editor, statistics, settings, tray, sound, window fitting
 cargo test --release frame_queries -- --ignored --nocapture   # per-frame cost with 3 years of history
 cargo clippy --all-targets -- -D warnings                      # lints
 cargo fmt                                                      # formatting (rustfmt.toml)

@@ -739,6 +739,40 @@ mod tests {
     }
 
     #[test]
+    fn settings_roundtrip() {
+        use crate::settings::{Corner, SoundChoice};
+        let path = temp_db("settings");
+        {
+            let s = Store::open(&path).unwrap();
+            assert_eq!(s.load_settings(), Settings::default(), "first start: the defaults");
+            let set = Settings {
+                corner: Corner::TopLeft,
+                sound: SoundChoice::File,
+                sound_file: "/home/me/alarm.ogg".into(),
+                time_presets: vec![10, 20],
+                ui_scale: 1.5,
+                ..Settings::default()
+            };
+            s.save_settings(&set).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let set = s.load_settings();
+        assert_eq!(
+            (set.corner, set.sound, set.sound_file.as_str()),
+            (Corner::TopLeft, SoundChoice::File, "/home/me/alarm.ogg")
+        );
+        assert_eq!((set.time_presets.as_slice(), set.ui_scale), (&[10, 20][..], 1.5));
+        // a UI scale from outside the allowed range is limited
+        s.save_settings(&Settings { ui_scale: 9.0, ..set }).unwrap();
+        assert_eq!(s.load_settings().ui_scale, 2.0);
+        // settings that can't be read: the defaults, instead of not starting
+        s.conn.execute("UPDATE settings SET value='not json' WHERE key='settings'", []).unwrap();
+        assert_eq!(s.load_settings(), Settings::default());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn window_geometry_roundtrip() {
         use crate::settings::WindowGeom;
         let s = Store::open(Path::new(":memory:")).unwrap();

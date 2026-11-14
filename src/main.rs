@@ -26,7 +26,7 @@ fn db_path() -> PathBuf {
         return PathBuf::from(p);
     }
     let dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("tasker");
-    let _ = std::fs::create_dir_all(&dir);
+    platform::create_private_dir(&dir);
     dir.join("tasker.db")
 }
 

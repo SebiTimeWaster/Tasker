@@ -11,6 +11,8 @@ use crate::platform::Output;
 use crate::settings::{Settings, SoundChoice};
 
 const RATE: u32 = 48_000;
+/// The lowest sample rate a sound file may have (telephone quality is 8 kHz).
+const MIN_RATE: u32 = 1_000;
 
 /// Interleaved stereo i16 samples.
 struct Sound {
@@ -158,10 +160,7 @@ fn audio_thread(rx: Receiver<Cmd>, last_error: Arc<Mutex<Option<String>>>) {
                 break 'play;
             }
             for f in 0..chunk_frames {
-                let t = if total > 0.0 { ((frame_no + f as u64) as f32 / total).min(1.0) } else { 1.0 };
-                let vol = req.start_volume + (req.end_volume - req.start_volume) * t;
-                // Perceptual-ish curve: amplitude grows with the square of the slider value.
-                let gain = vol.clamp(0.0, 1.0).powi(2);
+                let gain = ramp_gain(frame_no + f as u64, total, req.start_volume, req.end_volume);
                 for c in 0..2 {
                     let s = sound.data[pos + c] as f32 * gain;
                     buf[f * 2 + c] = s as i16;
@@ -189,6 +188,15 @@ fn audio_thread(rx: Receiver<Cmd>, last_error: Arc<Mutex<Option<String>>>) {
     }
 }
 
+/// The gain (0..=1) of frame `frame` of a sound whose volume ramps from `start` to `end`
+/// (slider values, 0..=1) over `ramp_frames` frames, staying at `end` afterwards.
+/// Perceptual-ish curve: the amplitude grows with the square of the slider value.
+fn ramp_gain(frame: u64, ramp_frames: f32, start: f32, end: f32) -> f32 {
+    let t = if ramp_frames > 0.0 { (frame as f32 / ramp_frames).min(1.0) } else { 1.0 };
+    let vol = start + (end - start) * t;
+    vol.clamp(0.0, 1.0).powi(2)
+}
+
 fn load_sound(req: &PlayRequest, cache: &mut HashMap<String, Arc<Sound>>) -> Result<Arc<Sound>, String> {
     let key = match req.choice {
         SoundChoice::File => format!("file:{}", req.file),
@@ -202,7 +210,11 @@ fn load_sound(req: &PlayRequest, cache: &mut HashMap<String, Arc<Sound>>) -> Res
             if req.file.trim().is_empty() {
                 return Err("No sound file selected".into());
             }
-            Arc::new(decode_file(&req.file)?)
+            let s = Arc::new(decode_file(&req.file)?);
+            // A decoded file can take tens of MB: keep only the one in use, not every
+            // file tried in the settings.
+            cache.retain(|k, _| !k.starts_with("file:"));
+            s
         }
         c => synth(c),
     };
@@ -271,6 +283,11 @@ fn decode_file(path: &str) -> Result<Sound, String> {
     if out.is_empty() || rate == 0 {
         return Err(format!("{path}: no audio decoded"));
     }
+    // Playback writes 20 ms chunks (rate / 50 frames): a damaged file claiming a tiny
+    // rate would make those empty and the playback loop spin.
+    if rate < MIN_RATE {
+        return Err(format!("{path}: unsupported sample rate {rate} Hz"));
+    }
     // Small gap between loops.
     out.extend(std::iter::repeat_n(0, (rate as usize / 2) * 2));
     Ok(Sound { rate, data: out })
@@ -326,4 +343,130 @@ fn synth(choice: SoundChoice) -> Arc<Sound> {
         })
         .collect();
     Arc::new(Sound { rate: RATE, data })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 16-bit PCM WAV file with the given channels, rate and interleaved samples.
+    fn wav(channels: u16, rate: u32, samples: &[i16]) -> Vec<u8> {
+        let data_len = (samples.len() * 2) as u32;
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data_len).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&rate.to_le_bytes());
+        v.extend_from_slice(&(rate * channels as u32 * 2).to_le_bytes());
+        v.extend_from_slice(&(channels * 2).to_le_bytes());
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data_len.to_le_bytes());
+        for s in samples {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v
+    }
+
+    fn temp_file(name: &str, bytes: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!("tasker-{name}-{}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn file_request(path: &str) -> PlayRequest {
+        PlayRequest {
+            choice: SoundChoice::File,
+            file: path.into(),
+            ramp_secs: 0.0,
+            start_volume: 1.0,
+            end_volume: 1.0,
+            max_duration: None,
+        }
+    }
+
+    #[test]
+    fn mono_files_play_on_both_channels() {
+        let samples: Vec<i16> = (0..2_205).map(|i| ((i % 100) * 300 - 15_000) as i16).collect();
+        let path = temp_file("mono.wav", &wav(1, 22_050, &samples));
+        let s = decode_file(&path).unwrap();
+        assert_eq!(s.rate, 22_050, "the file's own rate");
+        // stereo frames, followed by half a second of silence before the loop repeats
+        assert_eq!(s.data.len(), (2_205 + 22_050 / 2) * 2);
+        for (i, &v) in samples.iter().enumerate() {
+            let (l, r) = (s.data[2 * i], s.data[2 * i + 1]);
+            assert_eq!(l, r, "frame {i}: the same on both channels");
+            assert!((l as i32 - v as i32).abs() <= 1, "frame {i}: {l} vs {v}");
+        }
+        assert!(s.data[2_205 * 2..].iter().all(|&v| v == 0), "the gap is silent");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stereo_files_keep_their_channels() {
+        let path = temp_file("stereo.wav", &wav(2, 48_000, &[1_000, -1_000, 2_000, -2_000]));
+        let s = decode_file(&path).unwrap();
+        for (got, want) in s.data[..4].iter().zip([1_000, -1_000, 2_000, -2_000]) {
+            assert!((*got as i32 - want).abs() <= 1, "{got} vs {want}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn broken_files_are_errors() {
+        assert!(decode_file("/nonexistent/tasker-sound.wav").is_err(), "missing file");
+        let junk = temp_file("junk.wav", b"this is not a sound file at all");
+        assert!(decode_file(&junk).is_err(), "not audio");
+        let slow = temp_file("slow.wav", &wav(1, 10, &[100; 50]));
+        let e = decode_file(&slow).err().expect("a 10 Hz file is refused");
+        assert!(e.contains("sample rate"), "a tiny rate would make playback spin: {e}");
+        for p in [junk, slow] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn sound_cache_keeps_one_file() {
+        let mut cache = HashMap::new();
+        let req = |choice| PlayRequest { choice, ..file_request("") };
+        assert!(load_sound(&req(SoundChoice::File), &mut cache).is_err(), "no file chosen");
+        let chime = load_sound(&req(SoundChoice::Chime), &mut cache).unwrap();
+        assert!(Arc::ptr_eq(&chime, &load_sound(&req(SoundChoice::Chime), &mut cache).unwrap()), "cached");
+        let a = temp_file("a.wav", &wav(1, 8_000, &[500; 800]));
+        let b = temp_file("b.wav", &wav(1, 8_000, &[700; 800]));
+        load_sound(&file_request(&a), &mut cache).unwrap();
+        load_sound(&file_request(&b), &mut cache).unwrap();
+        let mut keys: Vec<String> = cache.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["Chime".to_string(), format!("file:{b}")], "only the latest file stays");
+        for p in [a, b] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn built_in_sounds() {
+        for c in [SoundChoice::Chime, SoundChoice::Bell, SoundChoice::Beep] {
+            let s = synth(c);
+            assert_eq!(s.rate, RATE);
+            assert!(!s.data.is_empty() && s.data.len().is_multiple_of(2), "{c:?}: stereo frames");
+            let peak = s.data.iter().map(|v| v.unsigned_abs()).max().unwrap();
+            assert!((peak as f32 - 0.8 * i16::MAX as f32).abs() < 2.0, "{c:?}: normalized to 80 %, got {peak}");
+        }
+    }
+
+    #[test]
+    fn volume_ramp() {
+        let ramp = 1_000.0;
+        assert_eq!(ramp_gain(0, ramp, 0.2, 1.0), 0.2 * 0.2, "starts at the start volume (squared)");
+        assert!((ramp_gain(500, ramp, 0.2, 1.0) - 0.6 * 0.6).abs() < 1e-6, "halfway");
+        assert_eq!(ramp_gain(1_000, ramp, 0.2, 1.0), 1.0);
+        assert_eq!(ramp_gain(99_999, ramp, 0.2, 1.0), 1.0, "stays at the end volume");
+        assert_eq!(ramp_gain(0, 0.0, 0.2, 0.5), 0.25, "no ramp: the end volume right away");
+        assert_eq!(ramp_gain(0, ramp, 1.0, 0.0), 1.0, "it can get quieter too");
+        assert_eq!(ramp_gain(0, ramp, 1.5, 1.5), 1.0, "out-of-range volumes are clamped");
+    }
 }

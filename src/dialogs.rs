@@ -772,13 +772,14 @@ struct Point {
 
 /// The occurrences of `task` up to `today` (timestamp `now`), oldest first.
 fn stats_points(store: &Store, task: &Task, today: NaiveDate, now: i64) -> Vec<Point> {
-    let runs: Vec<&Run> = store.runs_of(task.id).collect();
+    // by date: the loop below asks for every day, and a daily task piles up a run a day
+    let runs: std::collections::HashMap<NaiveDate, &Run> = store.runs_of(task.id).map(|r| (r.date, r)).collect();
     let start =
-        runs.iter().map(|r| r.date).chain([task.schedule.first_date()]).min().unwrap().max(today - Duration::days(400));
+        runs.keys().copied().chain([task.schedule.first_date()]).min().unwrap().max(today - Duration::days(400));
     let mut pts = Vec::new();
     let mut d = start;
     while d <= today {
-        let run = runs.iter().find(|r| r.date == d);
+        let run = runs.get(&d);
         if run.is_some() || task.schedule.occurs_on(d) {
             let p = match run {
                 Some(r) => {
@@ -812,6 +813,50 @@ fn stats_points(store: &Store, task: &Task, today: NaiveDate, now: i64) -> Vec<P
     }
     let skip = pts.len().saturating_sub(STATS_MAX_POINTS);
     pts.into_iter().skip(skip).collect()
+}
+
+/// The numbers above the statistics chart.
+#[derive(Debug, PartialEq)]
+struct Summary {
+    occurrences: usize,
+    /// Worked on (not missed, not given up).
+    started: usize,
+    done: usize,
+    failed: usize,
+    /// Neither worked on nor given up.
+    missed: usize,
+    /// Started ones that took longer than their estimate.
+    over: usize,
+    avg_tracked_min: f32,
+    total_tracked_min: f32,
+    /// How many started ones have a start delay, and how many of those were ≤ 5 min late.
+    with_delay: usize,
+    on_time: usize,
+    /// Average start delay in minutes (None: no start delays known).
+    avg_delay_min: Option<f32>,
+}
+
+impl Summary {
+    fn of(pts: &[Point]) -> Summary {
+        let started: Vec<&Point> = pts.iter().filter(|p| p.tracked_min.is_some()).collect();
+        let failed = pts.iter().filter(|p| p.failed).count();
+        let tracked: Vec<f32> = started.iter().filter_map(|p| p.tracked_min).collect();
+        let delays: Vec<i64> = started.iter().filter_map(|p| p.delay_min).collect();
+        let total_tracked_min = tracked.iter().sum::<f32>();
+        Summary {
+            occurrences: pts.len(),
+            started: started.len(),
+            done: pts.iter().filter(|p| p.done).count(),
+            failed,
+            missed: pts.len() - started.len() - failed,
+            over: started.iter().filter(|p| p.tracked_min.unwrap_or(0.0) > p.estimate_min as f32).count(),
+            avg_tracked_min: if tracked.is_empty() { 0.0 } else { total_tracked_min / tracked.len() as f32 },
+            total_tracked_min,
+            with_delay: delays.len(),
+            on_time: delays.iter().filter(|&&d| d <= 5).count(),
+            avg_delay_min: (!delays.is_empty()).then(|| delays.iter().sum::<i64>() as f32 / delays.len() as f32),
+        }
+    }
 }
 
 pub enum ListResult {
@@ -958,15 +1003,8 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
             return;
         }
         // ---- numbers
-        let n = pts.len();
-        let started: Vec<&Point> = pts.iter().filter(|p| p.tracked_min.is_some()).collect();
-        let done = pts.iter().filter(|p| p.done).count();
-        let failed = pts.iter().filter(|p| p.failed).count();
-        let avg = |v: &[f32]| if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 };
-        let tracked: Vec<f32> = started.iter().filter_map(|p| p.tracked_min).collect();
-        let delays: Vec<i64> = started.iter().filter_map(|p| p.delay_min).collect();
-        let on_time = delays.iter().filter(|&&d| d <= 5).count();
-        let over = started.iter().filter(|p| p.tracked_min.unwrap_or(0.0) > p.estimate_min as f32).count();
+        let sum = Summary::of(&pts);
+        let n = sum.occurrences;
         egui::Grid::new("stats-grid").num_columns(4).spacing([24.0, 4.0]).show(ui, |ui| {
             let kv = |ui: &mut Ui, k: &str, v: String| {
                 ui.label(RichText::new(k).weak());
@@ -976,27 +1014,25 @@ pub fn stats_ui(ctx: &egui::Context, store: &Store, task_id: i64) -> bool {
             kv(
                 ui,
                 "Started / done",
-                format!("{} / {}  ({:.0}% done)", started.len(), done, done as f32 * 100.0 / n as f32),
+                format!("{} / {}  ({:.0}% done)", sum.started, sum.done, sum.done as f32 * 100.0 / n as f32),
             );
             ui.end_row();
-            kv(ui, "Avg. tracked", fmt_duration_min(avg(&tracked).round() as u32));
-            kv(ui, "Over estimate", format!("{over} of {}", started.len()));
+            kv(ui, "Avg. tracked", fmt_duration_min(sum.avg_tracked_min.round() as u32));
+            kv(ui, "Over estimate", format!("{} of {}", sum.over, sum.started));
             ui.end_row();
             kv(
                 ui,
                 "Started on time",
-                if delays.is_empty() {
+                if sum.with_delay == 0 {
                     "–".into()
                 } else {
-                    format!("{on_time} of {} (≤ 5 min late)", delays.len())
+                    format!("{} of {} (≤ 5 min late)", sum.on_time, sum.with_delay)
                 },
             );
-            let avg_delay =
-                if delays.is_empty() { 0.0 } else { delays.iter().sum::<i64>() as f32 / delays.len() as f32 };
-            kv(ui, "Avg. start delay", if delays.is_empty() { "–".into() } else { format!("{avg_delay:+.0} min") });
+            kv(ui, "Avg. start delay", sum.avg_delay_min.map_or("–".into(), |d| format!("{d:+.0} min")));
             ui.end_row();
-            kv(ui, "Total tracked", fmt_duration_min(tracked.iter().sum::<f32>().round() as u32));
-            kv(ui, "Given up / missed", format!("{failed} / {}", n - started.len() - failed));
+            kv(ui, "Total tracked", fmt_duration_min(sum.total_tracked_min.round() as u32));
+            kv(ui, "Given up / missed", format!("{} / {}", sum.failed, sum.missed));
             ui.end_row();
         });
         ui.add_space(10.0);
@@ -1487,5 +1523,80 @@ mod tests {
         assert!(pts[0].tracked_min.is_none() && pts[2].tracked_min.is_none(), "missed days");
         assert!(!pts[0].failed && !pts[2].failed, "missed isn't given up");
         assert!(pts[3].failed && pts[3].tracked_min.is_none() && !pts[3].done, "given up");
+        let sum = Summary::of(&pts);
+        assert_eq!((sum.occurrences, sum.started, sum.done, sum.failed, sum.missed), (4, 1, 1, 1, 2));
+        assert_eq!((sum.over, sum.with_delay, sum.on_time, sum.avg_delay_min), (0, 1, 1, Some(5.0)));
+        assert_eq!((sum.avg_tracked_min, sum.total_tracked_min), (20.0, 20.0));
+    }
+
+    #[test]
+    fn statistics_summary() {
+        let p = |tracked_min: Option<f32>, delay_min: Option<i64>, done: bool, failed: bool| Point {
+            date: d(11, 1),
+            tracked_min,
+            estimate_min: 30,
+            delay_min,
+            done,
+            failed,
+        };
+        let pts = [
+            p(Some(20.0), Some(0), true, false),   // on time, within the estimate
+            p(Some(45.0), Some(12), true, false),  // late and over the estimate
+            p(Some(10.0), Some(-4), false, false), // early, still open
+            p(None, None, false, true),            // given up
+            p(None, None, false, false),           // missed
+        ];
+        assert_eq!(
+            Summary::of(&pts),
+            Summary {
+                occurrences: 5,
+                started: 3,
+                done: 2,
+                failed: 1,
+                missed: 1,
+                over: 1,
+                avg_tracked_min: 25.0,
+                total_tracked_min: 75.0,
+                with_delay: 3,
+                on_time: 2,
+                avg_delay_min: Some(8.0 / 3.0),
+            }
+        );
+        let none = Summary::of(&[p(None, None, false, false)]);
+        assert_eq!((none.started, none.missed, none.avg_tracked_min, none.avg_delay_min), (0, 1, 0.0, None));
+    }
+
+    #[test]
+    fn statistics_show_the_last_30_occurrences() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
+        let mut s = Store::open(Path::new(":memory:")).unwrap();
+        let from = today - Duration::days(60);
+        let every_day = Schedule::Weekdays { mask: 0b111_1111, from, every: WeekRepeat::Weekly };
+        let id = s.save_task(test_task("Mail", every_day, 8 * 60, 30)).unwrap();
+        let pts = stats_points(&s, s.task(id).unwrap(), today, 0);
+        assert_eq!(pts.len(), STATS_MAX_POINTS);
+        assert_eq!(pts.last().unwrap().date, today - Duration::days(1), "the most recent ones, oldest first");
+        assert_eq!(pts[0].date, today - Duration::days(30));
+    }
+
+    #[test]
+    fn new_task_defaults_are_applied_and_limited() {
+        let defaults = NewTaskDefaults {
+            estimate_min: 90,
+            priority: Priority::High,
+            notify: NotifyMode::Silent,
+            notify_ahead_min: 15,
+        };
+        let t = editor("Gym").with_defaults(&defaults).to_task().unwrap();
+        assert_eq!(
+            (t.estimate_min, t.priority, t.notify, t.notify_ahead_min),
+            (90, Priority::High, NotifyMode::Silent, 15)
+        );
+        // values from a damaged or hand-edited settings file can't exceed the editor's limits
+        let huge = NewTaskDefaults { estimate_min: 100_000, notify_ahead_min: 100_000, ..defaults };
+        let t = editor("Gym").with_defaults(&huge).to_task().unwrap();
+        assert_eq!((t.estimate_min, t.notify_ahead_min), (MAX_ESTIMATE_MIN, MAX_NOTIFY_AHEAD_MIN));
+        // a new task on another day starts at 09:00
+        assert_eq!(editor("Gym").to_task().unwrap().start_min, 9 * 60);
     }
 }

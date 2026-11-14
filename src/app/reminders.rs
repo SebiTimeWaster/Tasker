@@ -800,6 +800,27 @@ mod tests {
     }
 
     #[test]
+    fn snooze_time_of_an_entry() {
+        let (mut s, id) = store_with(|_| {});
+        let entry = |s: &Store| s.entry(id, day(), 1_000).unwrap();
+        assert_eq!(snoozed_until(&s, &entry(&s)), None, "not snoozed");
+        let due = NotifKind::Due { task_id: id, date: day() }.key();
+        s.set_notif(&due, NotifState { dismissed: false, snooze_until: Some(5_000) }).unwrap();
+        assert_eq!(snoozed_until(&s, &entry(&s)), Some(5_000));
+        s.set_notif(&due, NotifState { dismissed: true, snooze_until: Some(5_000) }).unwrap();
+        assert_eq!(snoozed_until(&s, &entry(&s)), None, "dismissed: it won't come back");
+        // a running task: its over-estimate reminder
+        let run = s.start(id, day(), 1_000).unwrap();
+        assert_eq!(snoozed_until(&s, &entry(&s)), None);
+        let over = NotifKind::Overrun { run_id: run }.key();
+        s.set_notif(&over, NotifState { dismissed: false, snooze_until: Some(7_000) }).unwrap();
+        assert_eq!(snoozed_until(&s, &entry(&s)), Some(7_000));
+        // paused or finished: no reminder to come back
+        s.pause(run, 2_000).unwrap();
+        assert_eq!(snoozed_until(&s, &entry(&s)), None);
+    }
+
+    #[test]
     fn reminder_keys_are_stable() {
         // Stored in the database: changing them would bring back dismissed reminders.
         assert_eq!(NotifKind::Due { task_id: 3, date: day() }.key(), "due:3:2026-11-06");

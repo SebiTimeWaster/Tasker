@@ -168,11 +168,12 @@ pub fn month_grid(
     }
 }
 
-/// The entry of `date` (out of the ones shown on it) to name in the week list.
-fn next_task(entries: &[Entry], date: NaiveDate) -> Option<&Entry> {
+/// The entry of `date` (out of the ones shown on it) to name in the week list, on `today`
+/// at minute of the day `now_min`.
+fn next_task(entries: &[Entry], date: NaiveDate, today: NaiveDate, now_min: u32) -> Option<&Entry> {
     let mut open = entries.iter().filter(|e| !e.status.is_closed());
-    if date == today() {
-        let nm = now_min() as i64;
+    if date == today {
+        let nm = now_min as i64;
         // running first, then the next upcoming one, then the oldest overdue one
         entries
             .iter()
@@ -252,7 +253,7 @@ fn week_list(app: &mut TaskerApp, ui: &mut Ui, rect: Rect) {
         // The second line sits as far above the row's bottom edge as the name sits below its
         // top edge, if there is room for it below the name.
         let second_line = |h: f32| Some(r.bottom() - ROW_PAD - h).filter(|&y| y >= r.top() + ROW_PAD + big);
-        if let Some(e) = next_task(&entries, d) {
+        if let Some(e) = next_task(&entries, d, today, now_min()) {
             let txt = format!("{}  {}", fmt_hm(e.start_min), e.title);
             let g = elided(ui, &txt, FontId::proportional(TEXT), Color32::from_gray(160), r.width() - 60.0);
             if let Some(y) = second_line(g.size().y) {
@@ -685,4 +686,37 @@ fn task_row(
         e.priority.color().gamma_multiply(if done { 0.4 } else { 1.0 }),
     );
     (r, action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn week_list_names_the_next_task() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
+        let once = Schedule::Date { date: day, repeat: Repeat::Never };
+        let entry = |title: &str, start_min: u32, status: EntryStatus| {
+            let mut e = Entry::from_task(&test_task(title, once.clone(), start_min, 30), day);
+            e.status = status;
+            e
+        };
+        let names =
+            |entries: &[Entry], today: NaiveDate, nm: u32| next_task(entries, day, today, nm).map(|e| e.title.clone());
+        let entries = [
+            entry("Mail", 8 * 60, EntryStatus::Done),
+            entry("Report", 9 * 60, EntryStatus::Virtual),
+            entry("Lunch", 12 * 60, EntryStatus::Virtual),
+            entry("Gym", 18 * 60, EntryStatus::Virtual),
+        ];
+        let tomorrow = day.succ_opt().unwrap();
+        assert_eq!(names(&entries, tomorrow, 11 * 60).as_deref(), Some("Report"), "another day: the first open one");
+        assert_eq!(names(&entries, day, 11 * 60).as_deref(), Some("Lunch"), "today: the next upcoming one");
+        assert_eq!(names(&entries, day, 20 * 60).as_deref(), Some("Report"), "none left: the oldest overdue one");
+        let mut busy = entries.clone();
+        busy[3].status = EntryStatus::Running;
+        assert_eq!(names(&busy, day, 11 * 60).as_deref(), Some("Gym"), "a running one comes first");
+        let all_done: Vec<Entry> = entries.iter().map(|e| Entry { status: EntryStatus::Done, ..e.clone() }).collect();
+        assert_eq!(names(&all_done, day, 11 * 60), None);
+    }
 }

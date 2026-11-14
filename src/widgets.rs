@@ -268,26 +268,13 @@ pub fn task_buttons(ui: &mut Ui, e: &Entry, give_up_wait: u64) -> Option<Action>
 /// Next to the task buttons: how far the scheduled start is away ("starts in 25 min",
 /// "12 min overdue") or how punctually it was started, plus when a snoozed reminder returns.
 pub fn start_offset_labels(ui: &mut Ui, e: &Entry, now: i64, snoozed_until: Option<i64>, on_red: bool) {
-    let gray = if on_red { Color32::from_gray(225) } else { Color32::from_gray(170) };
-    let warn = if on_red { Color32::WHITE } else { Color32::from_rgb(235, 100, 90) };
-    let (text, color) = match (e.status, e.first_start) {
-        (EntryStatus::Virtual, _) => {
-            let m = minutes_from_start(e.date, e.start_min, now);
-            match m {
-                ..0 => (format!("starts in {}", fmt_span_min(-m)), gray),
-                0 => ("starts now".to_string(), Color32::from_rgb(235, 200, 90)),
-                _ => (format!("{} overdue", fmt_span_min(m)), warn),
-            }
-        }
-        (_, Some(t)) => {
-            let m = minutes_from_start(e.date, e.start_min, t);
-            match m {
-                ..0 => (format!("started {} early", fmt_span_min(-m)), gray),
-                0 => ("started on time".to_string(), gray),
-                _ => (format!("started {} late", fmt_span_min(m)), gray),
-            }
-        }
-        _ => return,
+    let Some((text, tone)) = start_offset_text(e, now) else { return };
+    let color = match tone {
+        Tone::Plain if on_red => Color32::from_gray(225),
+        Tone::Plain => Color32::from_gray(170),
+        Tone::Now => Color32::from_rgb(235, 200, 90),
+        Tone::Warn if on_red => Color32::WHITE,
+        Tone::Warn => Color32::from_rgb(235, 100, 90),
     };
     ui.label(RichText::new(text).color(color));
     if let Some(until) = snoozed_until.filter(|&t| t > now) {
@@ -302,9 +289,71 @@ pub fn start_offset_labels(ui: &mut Ui, e: &Entry, now: i64, snoozed_until: Opti
     }
 }
 
+/// How a start offset label is colored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Plain,
+    /// It starts this minute.
+    Now,
+    /// Overdue.
+    Warn,
+}
+
+/// The text of [`start_offset_labels`]: for a planned task how far its start is away
+/// ("starts in 25 min", "12 min overdue"), for a started one how punctually it was first
+/// started. None for one that was given up without being started.
+pub fn start_offset_text(e: &Entry, now: i64) -> Option<(String, Tone)> {
+    Some(match (e.status, e.first_start) {
+        (EntryStatus::Virtual, _) => {
+            let m = minutes_from_start(e.date, e.start_min, now);
+            match m {
+                ..0 => (format!("starts in {}", fmt_span_min(-m)), Tone::Plain),
+                0 => ("starts now".to_string(), Tone::Now),
+                _ => (format!("{} overdue", fmt_span_min(m)), Tone::Warn),
+            }
+        }
+        (_, Some(t)) => {
+            let m = minutes_from_start(e.date, e.start_min, t);
+            let text = match m {
+                ..0 => format!("started {} early", fmt_span_min(-m)),
+                0 => "started on time".to_string(),
+                _ => format!("started {} late", fmt_span_min(m)),
+            };
+            (text, Tone::Plain)
+        }
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn start_offsets() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
+        let ts = |h: u32, m: u32| scheduled_at(day, h * 60 + m).and_local_timezone(Local).unwrap().timestamp();
+        let mut e =
+            Entry::from_task(&test_task("T", Schedule::Date { date: day, repeat: Repeat::Never }, 9 * 60, 30), day);
+        let text = |e: &Entry, now: i64| start_offset_text(e, now);
+        assert_eq!(text(&e, ts(8, 35)), Some(("starts in 25 min".into(), Tone::Plain)));
+        assert_eq!(text(&e, ts(9, 0) + 30), Some(("starts now".into(), Tone::Now)));
+        assert_eq!(text(&e, ts(9, 12)), Some(("12 min overdue".into(), Tone::Warn)));
+        assert_eq!(text(&e, ts(9, 0) + 26 * 3600), Some(("1 day 2 h overdue".into(), Tone::Warn)));
+        // started: how punctually, measured from the first start, whatever the time is now
+        e.status = EntryStatus::Running;
+        for (first, want) in
+            [(ts(8, 50), "started 10 min early"), (ts(9, 0), "started on time"), (ts(9, 5), "started 5 min late")]
+        {
+            e.first_start = Some(first);
+            assert_eq!(text(&e, ts(15, 0)), Some((want.into(), Tone::Plain)));
+        }
+        // given up without working on it: nothing to say
+        e.status = EntryStatus::Failed;
+        e.first_start = None;
+        assert_eq!(text(&e, ts(15, 0)), None);
+    }
 
     #[test]
     fn color_blend() {

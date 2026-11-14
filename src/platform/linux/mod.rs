@@ -49,8 +49,9 @@ pub fn pick_sound_file() -> Option<String> {
 /// Single instance over a Unix socket: a second launch connects and asks us to show up.
 pub mod instance {
     use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// In the user's runtime directory. Without one the socket goes to the temporary
     /// directory, which all users share: there its name says whose it is, so that two
@@ -64,9 +65,21 @@ pub mod instance {
         }
     }
 
+    /// Whether `path` exists and belongs to this user. In the shared temporary directory
+    /// another user could have put a socket under our name first; connecting to it would
+    /// make every start think Tasker is running already and quit.
+    pub(super) fn is_mine(path: &Path) -> bool {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.uid() == unsafe { libc::getuid() })
+    }
+
     /// If an instance is running, ask it to show its window and return true.
     pub fn ask_running_to_show() -> bool {
-        match UnixStream::connect(socket_path()) {
+        let path = socket_path();
+        if !is_mine(&path) {
+            return false;
+        }
+        match UnixStream::connect(&path) {
             Ok(mut s) => {
                 let _ = s.write_all(b"show\n");
                 true
@@ -80,8 +93,16 @@ pub mod instance {
     /// Become the running instance (None if the socket can't be created).
     pub fn listen() -> Option<Listener> {
         let path = socket_path();
-        let _ = std::fs::remove_file(&path); // left over from a crash
-        UnixListener::bind(&path).ok().map(Listener)
+        if is_mine(&path) {
+            let _ = std::fs::remove_file(&path); // left over from a crash
+        }
+        match UnixListener::bind(&path) {
+            Ok(l) => Some(Listener(l)),
+            Err(e) => {
+                crate::logfile::error(format!("single instance: cannot listen on {}: {e}", path.display()));
+                None
+            }
+        }
     }
 
     impl Listener {
@@ -100,5 +121,24 @@ pub mod instance {
     /// Remove the socket at exit.
     pub fn cleanup() {
         let _ = std::fs::remove_file(socket_path());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instance::is_mine;
+    use std::path::Path;
+
+    #[test]
+    fn only_own_sockets_are_trusted() {
+        let path = std::env::temp_dir().join(format!("tasker-owner-{}", std::process::id()));
+        assert!(!is_mine(&path), "missing");
+        std::fs::write(&path, b"").unwrap();
+        assert!(is_mine(&path));
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: getuid has no preconditions and cannot fail.
+        if unsafe { libc::getuid() } != 0 {
+            assert!(!is_mine(Path::new("/")), "owned by root");
+        }
     }
 }
